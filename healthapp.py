@@ -15,12 +15,24 @@ import re
 import time
 import os
 import random
-import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from collections import Counter
 from abc import ABC, abstractmethod
 from bs4 import BeautifulSoup
+
+# ── Optional packages (no crash if missing) ──────────────────
+try:
+    import anthropic
+    CLAUDE_AVAILABLE = True
+except ImportError:
+    CLAUDE_AVAILABLE = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # .env not required — works without it
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "healthwatch.db")
 
@@ -120,6 +132,7 @@ def init_db():
                 safety_reasons    TEXT,
                 pii_flagged       INTEGER DEFAULT 0,
                 pii_types         TEXT,
+                pii_confidence    TEXT,
                 adverse_event     TEXT,
                 entities          TEXT,
                 topics            TEXT,
@@ -133,9 +146,9 @@ def init_db():
             );
             INSERT OR IGNORE INTO source_engines (name, config) VALUES
                 ('Reddit',         '{"subreddits": ["AskDocs","DiagnoseMe","medical_advice","Longcovid","covidlonghaulers","cfs","Fibromyalgia","chronicpain"], "limit": 25}'),
-                ('PubMed',         '{"max_results": 10}'),
                 ('OpenFDA',        '{"max_results": 20}'),
-                ('ClinicalTrials', '{"max_results": 10}');
+                ('ClinicalTrials', '{"max_results": 10}'),
+                ('MedlinePlus',    '{"max_results": 10}');
         """)
 
 def get_projects():
@@ -182,9 +195,9 @@ def save_signals(pid, signals):
                         (project_id, source, post_id, author, title, body, url, post_date,
                          sentiment, sentiment_score, sentiment_detail,
                          risk_level, risk_score, risk_reason, confidence,
-                         safety_flag, safety_reasons, pii_flagged, pii_types,
+                         safety_flag, safety_reasons, pii_flagged, pii_types, pii_confidence,
                          adverse_event, entities, topics, summary, analyzed_by)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     pid,
                     s.get("source"), s.get("post_id"), s.get("author"),
@@ -192,7 +205,7 @@ def save_signals(pid, signals):
                     s.get("sentiment"), s.get("sentiment_score"), s.get("sentiment_detail"),
                     s.get("risk_level"), s.get("risk_score", 0), s.get("risk_reason"), s.get("confidence"),
                     int(s.get("safety_flag", 0)), s.get("safety_reasons", ""),
-                    int(s.get("pii_flagged", 0)), s.get("pii_types", ""),
+                    int(s.get("pii_flagged", 0)), s.get("pii_types", ""), s.get("pii_confidence", ""),
                     s.get("adverse_event", ""),
                     json.dumps(s.get("entities", {})),
                     json.dumps(s.get("topics", [])),
@@ -275,62 +288,51 @@ class RedditEngine(BaseEngine):
         return posts
 
 
-class PubMedEngine(BaseEngine):
-    name = "PubMed"
-    NON_HUMAN_TERMS = [
-        "porcine", "bovine", "equine", "murine", "canine", "feline",
-        "swine", "pig ", "mouse", "mice", "rat ", "rats ", "rabbit",
-        "veterinary", "livestock", "poultry", "ovine", "prrsv",
-        "avian", "broiler", "ruminant", "cattle", "sheep", "goat",
-    ]
+class MedlinePlusEngine(BaseEngine):
+    name = "MedlinePlus"
+    BASE = "https://wsearch.nlm.nih.gov/ws/query"
 
     def __init__(self, max_results=10):
         self.max_results = max_results
 
-    def _is_non_human(self, text: str) -> bool:
-        t = text.lower()
-        return any(term in t for term in self.NON_HUMAN_TERMS)
-
     def fetch(self, keywords):
         posts = []
-        for kw in keywords[:3]:
+        for kw in keywords[:4]:
             try:
-                sr = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-                                  params={"db": "pubmed", "term": kw, "retmax": self.max_results, "retmode": "json"},
-                                  timeout=10)
-                sr.raise_for_status()
-                ids = sr.json().get("esearchresult", {}).get("idlist", [])
-                if not ids:
-                    continue
-                fr = requests.get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
-                                  params={"db": "pubmed", "id": ",".join(ids), "rettype": "abstract", "retmode": "xml"},
-                                  timeout=15)
-                fr.raise_for_status()
-                root = ET.fromstring(fr.content)
-                for article in root.findall(".//PubmedArticle"):
-                    pmid_el = article.find(".//PMID")
-                    pmid = pmid_el.text if pmid_el is not None else str(random.randint(10000, 99999))
-                    title_el = article.find(".//ArticleTitle")
-                    title = title_el.text if title_el is not None else ""
-                    ab_el = article.find(".//AbstractText")
-                    body = ab_el.text if ab_el is not None else ""
-                    full = ((title or "") + " " + (body or "")).strip()
-                    if not self._relevant(full, keywords):
+                resp = requests.get(
+                    self.BASE,
+                    params={"db": "healthTopics", "term": kw, "retmax": self.max_results},
+                    headers={"User-Agent": "HealthWatch/1.0"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                root = ET.fromstring(resp.content)
+                for doc in root.findall(".//document"):
+                    url     = doc.get("url", "")
+                    title   = ""
+                    snippet = ""
+                    for content in doc.findall("content"):
+                        n = content.get("name", "")
+                        text = re.sub(r"<[^>]+>", "", content.text or "").strip()
+                        if n == "title":
+                            title = text
+                        elif n == "snippet":
+                            snippet = text
+                    if not title and not snippet:
                         continue
-                    if self._is_non_human(full):
-                        continue
+                    uid = abs(hash(url + kw))
                     posts.append({
-                        "source":    "PubMed",
-                        "post_id":   f"pubmed_{pmid}",
-                        "author":    "PubMed",
-                        "title":     (title or "").strip(),
-                        "body":      (body or "").strip(),
-                        "url":       f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                        "source":    "MedlinePlus",
+                        "post_id":   f"medline_{uid}",
+                        "author":    "MedlinePlus (NIH)",
+                        "title":     title[:200],
+                        "body":      snippet,
+                        "url":       url,
                         "post_date": datetime.now().strftime("%Y-%m-%d"),
                     })
-                time.sleep(0.4)
+                time.sleep(0.3)
             except Exception as e:
-                print(f"PubMed '{kw}': {e}")
+                st.warning(f"⚠️ MedlinePlus failed for '{kw}': {e}")
         return posts
 
 
@@ -423,11 +425,12 @@ class ClinicalTrialsEngine(BaseEngine):
         return posts
 
 
+
 ENGINES = {
     "Reddit":         RedditEngine,
-    "PubMed":         PubMedEngine,
     "OpenFDA":        OpenFDAEngine,
     "ClinicalTrials": ClinicalTrialsEngine,
+    "MedlinePlus":    MedlinePlusEngine,
 }
 
 def get_engine(name):
@@ -627,7 +630,7 @@ def score_risk(text, sentiment_label, safety_flag, source=""):
     }
 
 # ===========================================================
-# SAFETY DETECTION — word-boundary matching (no substring false positives)
+# SAFETY DETECTION — word-boundary matching
 # ===========================================================
 
 def detect_safety(text):
@@ -664,6 +667,79 @@ def tag_topics(text):
     return [tag for tag, kws in TOPIC_MAP.items() if any(k in t for k in kws)]
 
 # ===========================================================
+# CLAUDE AI ANALYZER  (optional — only works if anthropic
+#                      package is installed AND API key is set)
+# ===========================================================
+
+class ClaudeAnalyzer:
+    def __init__(self):
+        self.client = None
+        if not CLAUDE_AVAILABLE:
+            return
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        if api_key:
+            self.client = anthropic.Anthropic(api_key=api_key)
+
+    def analyze(self, post):
+        if not self.client:
+            return heuristic_analyze(post)
+
+        text = f"{post.get('title','')} {post.get('body','')}".strip()
+        prompt = f"""You are a medical safety signal analyzer.
+Analyze the following patient text and return STRICT JSON with:
+- sentiment (Positive/Negative/Neutral)
+- sentiment_score (-1 to 1)
+- risk_level (Low/Medium/High)
+- risk_score (0-100)
+- risk_reason (short explanation)
+- safety_flag (true/false)
+- safety_reasons (string)
+- topics (list)
+- adverse_event (short phrase)
+- pii_flagged (true/false)
+
+TEXT:
+\"\"\"{text}\"\"\"
+
+ONLY RETURN JSON. NO EXTRA TEXT."""
+
+        try:
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=500,
+                temperature=0,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            raw = response.content[0].text.strip()
+            json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON in response")
+            data = json.loads(json_match.group(0))
+            return {
+                **post,
+                "sentiment":        data.get("sentiment", "Neutral"),
+                "sentiment_score":  data.get("sentiment_score", 0),
+                "sentiment_detail": "",
+                "risk_level":       data.get("risk_level", "Low"),
+                "risk_score":       data.get("risk_score", 0),
+                "risk_reason":      data.get("risk_reason", ""),
+                "confidence":       0.9,
+                "safety_flag":      int(data.get("safety_flag", False)),
+                "safety_reasons":   data.get("safety_reasons", ""),
+                "pii_flagged":      int(data.get("pii_flagged", False)),
+                "pii_types":        "",
+                "pii_confidence":   "",
+                "topics":           data.get("topics", []),
+                "adverse_event":    data.get("adverse_event", ""),
+                "entities":         extract_entities(text),
+                "summary":          text[:200],
+                "analyzed_by":      "claude",
+            }
+        except Exception as e:
+            print("Claude failed, using heuristic:", e)
+            return heuristic_analyze(post)
+
+# ===========================================================
 # ANALYSIS PIPELINE
 # ===========================================================
 
@@ -681,15 +757,32 @@ def heuristic_analyze(post):
             "entities": entities, "topics": topics,
             "adverse_event": ae, "summary": text[:200], "analyzed_by": "heuristic"}
 
-def analyze_batch(posts):
+def analyze_batch(posts, use_claude=False):
     results = []
-    if posts:
-        bar = st.progress(0, text="Analysing posts...")
-        n = len(posts)
-        for i, post in enumerate(posts):
+    if not posts:
+        return results
+
+    bar = st.progress(0, text="Analysing posts...")
+    n = len(posts)
+
+    analyzer = None
+    if use_claude and CLAUDE_AVAILABLE and os.getenv("ANTHROPIC_API_KEY"):
+        if "claude_analyzer" not in st.session_state:
+            st.session_state.claude_analyzer = ClaudeAnalyzer()
+        analyzer = st.session_state.claude_analyzer
+
+    for i, post in enumerate(posts):
+        try:
+            if analyzer and analyzer.client:
+                results.append(analyzer.analyze(post))
+            else:
+                results.append(heuristic_analyze(post))
+        except Exception as e:
+            print(f"Analysis failed: {e}")
             results.append(heuristic_analyze(post))
-            bar.progress((i + 1) / n, text=f"Analysing {i + 1}/{n}...")
-        bar.empty()
+        bar.progress((i + 1) / n, text=f"Analysing {i + 1}/{n}...")
+
+    bar.empty()
     return results
 
 # ===========================================================
@@ -805,9 +898,7 @@ def compute_trends(signals):
 # ===========================================================
 
 def trend_card(insight: str) -> str:
-    """Convert markdown bold to HTML and wrap in trend-card div."""
-    import re as _re
-    html = _re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', insight)
+    html = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', insight)
     return f'<div class="trend-card">{html}</div>'
 
 init_db()
@@ -829,6 +920,33 @@ with st.sidebar:
     page = st.radio("Navigate", [
         "🏠 Dashboard", "📁 Projects", "🔍 Run Analysis", "📊 Signals & Trends", "⚙️ Admin"
     ])
+    st.markdown("---")
+
+    # Claude AI — optional API key input
+    st.markdown("**🤖 Claude AI Analysis**")
+    key_input = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        placeholder="sk-ant-... (optional)",
+        help="Paste your key from console.anthropic.com — leave blank to use free heuristic mode",
+        label_visibility="collapsed",
+    )
+    if key_input:
+        os.environ["ANTHROPIC_API_KEY"] = key_input
+
+    _claude_ready = CLAUDE_AVAILABLE and bool(os.getenv("ANTHROPIC_API_KEY", ""))
+    use_claude = st.checkbox(
+        "Enable Claude AI Analysis",
+        value=False,
+        disabled=not _claude_ready,
+        help="Enter an Anthropic API key above to enable",
+    )
+    if not CLAUDE_AVAILABLE:
+        st.caption("⚡ Heuristic mode active")
+    elif not _claude_ready:
+        st.caption("⚡ Heuristic mode — enter key to enable Claude")
+    else:
+        st.caption("✅ Claude AI ready")
 
 # ── DASHBOARD ───────────────────────────────────────────────
 if page == "🏠 Dashboard":
@@ -906,18 +1024,18 @@ elif page == "📁 Projects":
             st.info("No projects yet. Use the Create tab to get started.")
         for p in projects:
             kws  = json.loads(p.get("keywords", "[]"))
-            srcs = json.loads(p.get("sources", "[]"))
+            srcs = json.loads(p.get("sources",  "[]"))
             sigs = get_signals(p["id"])
             with st.expander(f"📁 **{p['name']}** — {len(sigs)} signals | {p.get('latency', 'daily')} updates"):
                 c1, c2 = st.columns([3, 1])
                 with c1:
-                    nn = st.text_input("Name",        value=p["name"],               key=f"n{p['id']}")
-                    nd = st.text_area("Description",  value=p.get("description", ""),key=f"d{p['id']}", height=60)
-                    nk = st.text_input("Keywords",    value=", ".join(kws),          key=f"k{p['id']}")
+                    nn = st.text_input("Name",        value=p["name"],                key=f"n{p['id']}")
+                    nd = st.text_area("Description",  value=p.get("description", ""), key=f"d{p['id']}", height=60)
+                    nk = st.text_input("Keywords",    value=", ".join(kws),           key=f"k{p['id']}")
                     ns = st.multiselect("Sources",    available,
-                                        default=[s for s in srcs if s in available], key=f"s{p['id']}")
+                                        default=[s for s in srcs if s in available],  key=f"s{p['id']}")
                     nl = st.selectbox("Latency",      ["realtime", "daily", "weekly"],
-                                      index=["realtime", "daily", "weekly"].index(p.get("latency", "daily")),
+                                      index=["realtime","daily","weekly"].index(p.get("latency","daily")),
                                       key=f"l{p['id']}")
                 with c2:
                     if st.button("💾 Save", key=f"sv{p['id']}"):
@@ -929,53 +1047,92 @@ elif page == "📁 Projects":
 # ── RUN ANALYSIS ────────────────────────────────────────────
 elif page == "🔍 Run Analysis":
     st.title("🔍 Fetch & Analyse Patient Signals")
-    projects = get_projects()
-    if not projects:
-        st.warning("⚠️ No projects found. Please create a project first.")
-        st.stop()
 
-    pm      = {p["name"]: p for p in projects}
-    project = pm[st.selectbox("Select Project", list(pm.keys()))]
-    keywords = json.loads(project.get("keywords", "[]"))
-    sources  = json.loads(project.get("sources", "[]"))
-    latency  = project.get("latency", "daily")
+    mode_label = "🤖 Claude AI" if (use_claude and _claude_ready) else "⚡ Heuristic"
+    st.info(f"ℹ️ **Analysis mode:** {mode_label} | **Pipeline:** Negation-aware sentiment → Entity extraction → 0-100 risk scoring → International PII detection → Topic classification")
 
-    st.markdown(f"""
-    **Project Configuration:**
-    - **Keywords:** `{', '.join(keywords)}`
-    - **Data Sources:** `{', '.join(sources)}`
-    - **Update Frequency:** `{latency}`
-    """)
-    st.info("ℹ️ **Pipeline:** Negation-aware sentiment → Entity extraction → 0-100 risk scoring → International PII detection → Topic classification")
+    tab1, tab2 = st.tabs(["🌐 Live Fetch", "📂 Upload CSV"])
 
-    if st.button("🚀 Start Fetch & Analysis", type="primary"):
-        all_posts = []
-        with st.status("📡 Fetching data from sources...", expanded=True) as status:
-            for source in sources:
-                st.write(f"📡 Fetching from **{source}**...")
-                try:
-                    engine = get_engine(source)
-                    fetched = engine.fetch(keywords)
-                    st.write(f"   ✅ Retrieved {len(fetched)} relevant posts")
-                    all_posts.extend(fetched)
-                except Exception as e:
-                    st.error(f"   ❌ {source}: {e}")
-            status.update(label=f"✅ Fetched {len(all_posts)} total posts.", state="complete")
-
-        if all_posts:
-            analyzed = analyze_batch(all_posts)
-            save_signals(project["id"], analyzed)
-            st.success(f"✅ Saved {len(analyzed)} signals!")
-            df = pd.DataFrame(analyzed)
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Total",          len(df))
-            c2.metric("🔴 High Risk",   int((df["risk_level"] == "High").sum()))
-            c3.metric("Avg Risk Score", f"{df['risk_score'].mean():.0f}/100")
-            c4.metric("⚠️ Safety",      int(df["safety_flag"].sum()))
-            c5.metric("🔒 PII",         int(df["pii_flagged"].sum()))
-            st.balloons()
+    with tab1:
+        projects = get_projects()
+        if not projects:
+            st.warning("⚠️ No projects found. Please create a project first in 📁 Projects.")
         else:
-            st.warning("⚠️ No posts retrieved. Try adjusting your keywords or sources.")
+            pm       = {p["name"]: p for p in projects}
+            project  = pm[st.selectbox("Select Project", list(pm.keys()))]
+            keywords = json.loads(project.get("keywords", "[]"))
+            sources  = json.loads(project.get("sources",  "[]"))
+            latency  = project.get("latency", "daily")
+            st.markdown(f"""
+            **Project Configuration:**
+            - **Keywords:** `{', '.join(keywords)}`
+            - **Data Sources:** `{', '.join(sources)}`
+            - **Update Frequency:** `{latency}`
+            """)
+            if st.button("🚀 Start Fetch & Analysis", type="primary"):
+                all_posts = []
+                with st.status("📡 Fetching data from sources...", expanded=True) as status:
+                    for source in sources:
+                        st.write(f"📡 Fetching from **{source}**...")
+                        try:
+                            engine  = get_engine(source)
+                            fetched = engine.fetch(keywords)
+                            st.write(f"   ✅ Retrieved {len(fetched)} relevant posts")
+                            all_posts.extend(fetched)
+                        except Exception as e:
+                            st.error(f"   ❌ {source}: {e}")
+                    status.update(label=f"✅ Fetched {len(all_posts)} total posts.", state="complete")
+                if all_posts:
+                    analyzed = analyze_batch(all_posts, use_claude=use_claude)
+                    save_signals(project["id"], analyzed)
+                    st.success(f"✅ Saved {len(analyzed)} signals!")
+                    df = pd.DataFrame(analyzed)
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Total",          len(df))
+                    c2.metric("🔴 High Risk",   int((df["risk_level"] == "High").sum()))
+                    c3.metric("Avg Risk Score", f"{df['risk_score'].mean():.0f}/100")
+                    c4.metric("⚠️ Safety",      int(df["safety_flag"].sum()))
+                    c5.metric("🔒 PII",         int(df["pii_flagged"].sum()))
+                    st.balloons()
+                else:
+                    st.warning("⚠️ No posts retrieved. Try adjusting your keywords or sources.")
+
+    with tab2:
+        st.markdown("Upload a CSV file for offline analysis — no project setup needed.")
+        proj_name = st.text_input("Project name for this upload", placeholder="e.g., My Survey Data")
+        uploaded  = st.file_uploader("Choose CSV file", type="csv")
+
+        if uploaded and proj_name.strip():
+            udf  = pd.read_csv(uploaded)
+            udf  = udf.fillna("")
+            cols = list(udf.columns)
+            st.success(f"✅ Loaded {len(udf)} rows — columns: `{', '.join(cols)}`")
+            c1, c2 = st.columns(2)
+            title_col = c1.selectbox("Column → Title", cols, index=0)
+            body_col  = c2.selectbox("Column → Body",  cols, index=min(1, len(cols)-1))
+            src_col   = c1.selectbox("Column → Source (optional)",    ["— none —"] + cols)
+            date_col  = c2.selectbox("Column → Post Date (optional)", ["— none —"] + cols)
+            if st.button("🔬 Analyse CSV", type="primary"):
+                existing = {p["name"]: p["id"] for p in get_projects()}
+                if proj_name.strip() in existing:
+                    pid = existing[proj_name.strip()]
+                else:
+                    pid = create_project(proj_name.strip(), "CSV upload project", [], [], "daily")
+                udf["title"]     = udf[title_col].astype(str)
+                udf["body"]      = udf[body_col].astype(str)
+                udf["source"]    = udf[src_col].astype(str)  if src_col  != "— none —" else "CSV Upload"
+                udf["post_date"] = udf[date_col].astype(str) if date_col != "— none —" else datetime.now().strftime("%Y-%m-%d")
+                udf["post_id"]   = [f"csv_{int(datetime.now().timestamp())}_{i}" for i in range(len(udf))]
+                udf["author"]    = "CSV Upload"
+                udf["url"]       = ""
+                posts    = udf.to_dict("records")
+                analyzed = analyze_batch(posts, use_claude=use_claude)
+                save_signals(pid, analyzed)
+                st.success(f"✅ Saved {len(analyzed)} signals to project **{proj_name}**!")
+                st.dataframe(pd.DataFrame(analyzed)[["title","sentiment","risk_level","risk_score"]].head(20))
+                st.balloons()
+        elif uploaded and not proj_name.strip():
+            st.warning("⚠️ Enter a project name above before analysing.")
 
 # ── SIGNALS & TRENDS ────────────────────────────────────────
 elif page == "📊 Signals & Trends":
@@ -1033,7 +1190,6 @@ elif page == "📊 Signals & Trends":
     st.markdown("---")
 
     RISK_C = {"High": "#E24B4A", "Medium": "#EF9F27", "Low": "#639922"}
-    SENT_C = {"Positive": "#639922", "Negative": "#E24B4A", "Neutral": "#888780"}
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1115,7 +1271,7 @@ elif page == "📊 Signals & Trends":
     st.markdown("---")
     st.subheader("📋 All Signals")
     display_cols = [c for c in ["post_date", "source", "title", "sentiment", "risk_level",
-                                 "risk_score", "safety_flag", "pii_flagged", "adverse_event"] if c in fdf.columns]
+                                 "risk_score", "safety_flag", "pii_flagged", "adverse_event", "analyzed_by"] if c in fdf.columns]
     st.dataframe(fdf[display_cols].head(100), width='stretch', height=400)
     csv = fdf.drop(columns=["id", "project_id"], errors="ignore").to_csv(index=False)
     st.download_button("📥 Download CSV", csv, f"{project['name']}_signals.csv", "text/csv")
