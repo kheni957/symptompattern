@@ -145,10 +145,13 @@ def init_db():
                 config TEXT DEFAULT '{}'
             );
             INSERT OR IGNORE INTO source_engines (name, config) VALUES
-                ('Reddit',         '{"subreddits": ["AskDocs","DiagnoseMe","medical_advice","Longcovid","covidlonghaulers","cfs","Fibromyalgia","chronicpain"], "limit": 25}'),
-                ('OpenFDA',        '{"max_results": 20}'),
-                ('ClinicalTrials', '{"max_results": 10}'),
-                ('MedlinePlus',    '{"max_results": 10}');
+                ('Reddit',        '{"subreddits": ["AskDocs","DiagnoseMe","medical_advice","Longcovid","covidlonghaulers","cfs","Fibromyalgia","chronicpain"], "limit": 25}'),
+                ('PubMed',        '{"max_results": 10}'),
+                ('OpenFDA',       '{"max_results": 20}'),
+                ('ClinicalTrials','{"max_results": 10}'),
+                ('MedlinePlus',   '{"max_results": 10}'),
+                ('HealthBoards',  '{"max_results": 15}'),
+                ('Twitter',       '{"max_results": 20}');
         """)
 
 def get_projects():
@@ -285,6 +288,67 @@ class RedditEngine(BaseEngine):
                 time.sleep(1.2)
             except Exception as e:
                 print(f"Reddit r/{sub}: {e}")
+        return posts
+
+
+class PubMedEngine(BaseEngine):
+    name = "PubMed"
+    NON_HUMAN_TERMS = [
+        "porcine", "bovine", "equine", "murine", "canine", "feline",
+        "swine", "pig ", "mouse", "mice", "rat ", "rats ", "rabbit",
+        "veterinary", "livestock", "poultry", "ovine", "prrsv",
+        "avian", "broiler", "ruminant", "cattle", "sheep", "goat",
+    ]
+
+    def __init__(self, max_results=10):
+        self.max_results = max_results
+
+    def _is_non_human(self, text: str) -> bool:
+        t = text.lower()
+        return any(term in t for term in self.NON_HUMAN_TERMS)
+
+    def fetch(self, keywords):
+        posts = []
+        for kw in keywords[:3]:
+            try:
+                sr = requests.get(
+                    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+                    params={"db": "pubmed", "term": kw, "retmax": self.max_results, "retmode": "json"},
+                    timeout=10,
+                )
+                sr.raise_for_status()
+                ids = sr.json().get("esearchresult", {}).get("idlist", [])
+                if not ids:
+                    continue
+                fr = requests.get(
+                    "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+                    params={"db": "pubmed", "id": ",".join(ids), "rettype": "abstract", "retmode": "xml"},
+                    timeout=15,
+                )
+                fr.raise_for_status()
+                root = ET.fromstring(fr.content)
+                for article in root.findall(".//PubmedArticle"):
+                    pmid_el  = article.find(".//PMID")
+                    pmid     = pmid_el.text if pmid_el is not None else str(random.randint(10000, 99999))
+                    title_el = article.find(".//ArticleTitle")
+                    title    = title_el.text if title_el is not None else ""
+                    ab_el    = article.find(".//AbstractText")
+                    body     = ab_el.text if ab_el is not None else ""
+                    full     = ((title or "") + " " + (body or "")).strip()
+                    if self._is_non_human(full):
+                        continue
+                    posts.append({
+                        "source":    "PubMed",
+                        "post_id":   f"pubmed_{pmid}",
+                        "author":    "PubMed",
+                        "title":     (title or "").strip(),
+                        "body":      (body or "").strip(),
+                        "url":       f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                        "post_date": datetime.now().strftime("%Y-%m-%d"),
+                    })
+                time.sleep(0.4)
+            except Exception as e:
+                st.warning(f"⚠️ PubMed failed for '{kw}': {e}")
         return posts
 
 
@@ -425,12 +489,139 @@ class ClinicalTrialsEngine(BaseEngine):
         return posts
 
 
+class TwitterEngine(BaseEngine):
+    name = "Twitter"
+    BASE = "https://api.twitterapi.io/twitter/tweet/advanced_search"
+
+    def __init__(self, max_results=20):
+        self.max_results = max_results
+
+    def fetch(self, keywords):
+        api_key = os.getenv("TWITTER_API_KEY", "")
+        if not api_key:
+            st.warning("⚠️ Twitter: No API key set — enter it in the sidebar.")
+            return []
+        posts = []
+        for kw in keywords[:3]:
+            try:
+                query = f"{kw} lang:en -is:retweet"
+                resp = requests.get(
+                    self.BASE,
+                    params={"query": query, "queryType": "Latest"},
+                    headers={"X-API-Key": api_key},
+                    timeout=15,
+                )
+                if resp.status_code == 401:
+                    st.warning("⚠️ Twitter: Invalid API key.")
+                    return []
+                if resp.status_code == 429:
+                    st.warning("⚠️ Twitter: Rate limited — try again shortly.")
+                    break
+                resp.raise_for_status()
+                data = resp.json()
+                tweets = data.get("tweets", [])
+                for tweet in tweets[:self.max_results]:
+                    text = tweet.get("text", "")
+                    if not text or len(text) < 30:
+                        continue
+                    author = tweet.get("author", {})
+                    uname  = author.get("userName", "unknown")
+                    tid    = tweet.get("id", str(random.randint(100000, 999999)))
+                    raw_date = tweet.get("createdAt", "")
+                    try:
+                        parsed   = datetime.strptime(raw_date, "%a %b %d %H:%M:%S +0000 %Y")
+                        post_date = parsed.strftime("%Y-%m-%d")
+                    except:
+                        post_date = datetime.now().strftime("%Y-%m-%d")
+                    url = tweet.get("url") or f"https://twitter.com/{uname}/status/{tid}"
+                    posts.append({
+                        "source":    "Twitter",
+                        "post_id":   f"tw_{tid}",
+                        "author":    f"@{uname}",
+                        "title":     text[:120],
+                        "body":      text,
+                        "url":       url,
+                        "post_date": post_date,
+                    })
+                time.sleep(1)
+            except Exception as e:
+                st.warning(f"⚠️ Twitter failed for '{kw}': {e}")
+        return posts
+
+
+class HealthBoardsEngine(BaseEngine):
+    name = "HealthBoards"
+    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    BASE = "https://www.healthboards.com/boards/search.php"
+
+    def __init__(self, max_results=15):
+        self.max_results = max_results
+
+    def fetch(self, keywords):
+        posts = []
+        for kw in keywords[:3]:
+            try:
+                resp = requests.get(
+                    self.BASE,
+                    params={"query": kw, "action": "results", "searchdate": "0", "order": "descdate"},
+                    headers=self.HEADERS,
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # Try several selector patterns for thread titles
+                results = (
+                    soup.find_all("div", class_=re.compile(r"searchresult", re.I)) or
+                    soup.find_all("h3", class_=re.compile(r"thread|title", re.I)) or
+                    soup.select("ol.searchresults li") or
+                    soup.find_all("a", href=re.compile(r"/boards/\w+/\d+"))
+                )
+                seen = set()
+                for result in results[:self.max_results * 2]:
+                    # Grab link + title
+                    link_el = result if result.name == "a" else result.find("a", href=re.compile(r"/boards/"))
+                    if not link_el:
+                        continue
+                    title = link_el.get_text(strip=True)
+                    url   = link_el.get("href", "")
+                    if not url.startswith("http"):
+                        url = "https://www.healthboards.com" + url
+                    if not title or len(title) < 10 or url in seen:
+                        continue
+                    seen.add(url)
+                    # Snippet / body text
+                    snippet_el = (
+                        result.find("div", class_=re.compile(r"snippet|content|post|body", re.I))
+                        if result.name != "a" else None
+                    )
+                    body = snippet_el.get_text(" ", strip=True) if snippet_el else title
+                    uid  = abs(hash(url + kw))
+                    posts.append({
+                        "source":    "HealthBoards",
+                        "post_id":   f"hb_{uid}",
+                        "author":    "HealthBoards User",
+                        "title":     title[:200],
+                        "body":      body[:800],
+                        "url":       url,
+                        "post_date": datetime.now().strftime("%Y-%m-%d"),
+                    })
+                    if len(posts) >= self.max_results:
+                        break
+                time.sleep(1)
+            except Exception as e:
+                st.warning(f"⚠️ HealthBoards failed for '{kw}': {e}")
+        return posts
+
 
 ENGINES = {
-    "Reddit":         RedditEngine,
-    "OpenFDA":        OpenFDAEngine,
+    "Reddit":        RedditEngine,
+    "PubMed":        PubMedEngine,
+    "OpenFDA":       OpenFDAEngine,
     "ClinicalTrials": ClinicalTrialsEngine,
-    "MedlinePlus":    MedlinePlusEngine,
+    "MedlinePlus":   MedlinePlusEngine,
+    "HealthBoards":  HealthBoardsEngine,
+    "Twitter":       TwitterEngine,
 }
 
 def get_engine(name):
@@ -948,6 +1139,21 @@ with st.sidebar:
     else:
         st.caption("✅ Claude AI ready")
 
+    st.markdown("---")
+    st.markdown("**🐦 Twitter / X**")
+    tw_key = st.text_input(
+        "Twitter API Key (twitterapi.io)",
+        type="password",
+        placeholder="paste key from twitterapi.io",
+        label_visibility="collapsed",
+    )
+    if tw_key:
+        os.environ["TWITTER_API_KEY"] = tw_key
+    if os.getenv("TWITTER_API_KEY"):
+        st.caption("✅ Twitter ready")
+    else:
+        st.caption("⚡ No key — Twitter disabled")
+
 # ── DASHBOARD ───────────────────────────────────────────────
 if page == "🏠 Dashboard":
     st.title("🏥 HealthWatch Dashboard")
@@ -1272,7 +1478,7 @@ elif page == "📊 Signals & Trends":
     st.subheader("📋 All Signals")
     display_cols = [c for c in ["post_date", "source", "title", "sentiment", "risk_level",
                                  "risk_score", "safety_flag", "pii_flagged", "adverse_event", "analyzed_by"] if c in fdf.columns]
-    st.dataframe(fdf[display_cols].head(100), width='stretch', height=400)
+    st.dataframe(fdf[display_cols].head(100), use_container_width=True, height=400)
     csv = fdf.drop(columns=["id", "project_id"], errors="ignore").to_csv(index=False)
     st.download_button("📥 Download CSV", csv, f"{project['name']}_signals.csv", "text/csv")
 
