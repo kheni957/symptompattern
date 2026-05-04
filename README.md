@@ -67,14 +67,28 @@ The database is recreated automatically on startup.
 
 ## Data Sources
 
-| Source | Type | Notes |
-|--------|------|-------|
-| Reddit | Patient forums | No key required |
-| OpenFDA | FDA adverse event reports | No key required |
-| ClinicalTrials | Completed clinical studies | No key required |
-| MedlinePlus | NIH health topics | No key required |
+| Source | Type | API Key Required |
+|--------|------|-----------------|
+| Reddit | Patient forums | No |
+| PubMed | Biomedical research abstracts | No |
+| OpenFDA | FDA adverse event reports | No |
+| ClinicalTrials | Completed clinical studies | No |
+| MedlinePlus | NIH health topics | No |
+| HealthBoards | Patient discussion forum | No |
+| Twitter / X | Real-time patient posts | Yes — twitterapi.io |
 
-All sources are free and require no API keys or accounts.
+Reddit, PubMed, OpenFDA, ClinicalTrials, MedlinePlus, and HealthBoards are all free with no account needed. Twitter requires a key from [twitterapi.io](https://twitterapi.io) (see below).
+
+---
+
+## Optional: Twitter / X
+
+To enable Twitter as a data source:
+
+1. Sign up at [twitterapi.io](https://twitterapi.io) and copy your API key
+2. Paste it into the **🐦 Twitter / X** field in the sidebar
+
+The key is session-only and never saved to disk. If no key is entered, Twitter is simply skipped during fetches.
 
 ---
 
@@ -95,7 +109,7 @@ The key is session-only and never saved to disk.
 ## Getting Started
 
 1. Go to **📁 Projects** → create a project with keywords (e.g. `ibuprofen, side effects, pain`)
-2. Select data sources (Reddit + OpenFDA recommended for starters)
+2. Select data sources (Reddit + OpenFDA recommended for starters; add PubMed or HealthBoards for broader coverage)
 3. Go to **🔍 Run Analysis** → select your project → click **Start Fetch & Analysis**
 4. View results in **📊 Signals & Trends**
 
@@ -114,5 +128,11 @@ Go to **🔍 Run Analysis → Upload CSV tab** to analyse your own data without 
 **No signals found** — try broader keywords (single words like `ibuprofen` work better than phrases)
 
 **Reddit returns 0 posts** — Reddit rate-limits aggressively; wait 60 seconds and try again
+
+**PubMed returns 0 posts** — NCBI rate-limits to ~3 requests/second; wait 60 seconds and retry with simpler keywords
+
+**HealthBoards returns 0 posts** — the site occasionally blocks scrapers; wait a minute and try again
+
+**Twitter returns 0 posts** — check that your twitterapi.io key is entered in the sidebar; if rate-limited, wait a few minutes
 
 **Database errors** — delete `healthwatch.db` and restart
