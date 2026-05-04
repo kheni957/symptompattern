@@ -1,394 +1,747 @@
+
+#HealthWatch — Patient Signal Monitor
+#Full implementation: DB layer, fetch engines (Reddit + Mock), AI analysis (Claude + heuristics)
+
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import requests
-import os
+import sqlite3
+import json
+import re
 import time
-from datetime import datetime
+import os
+import random
+from datetime import datetime, timedelta
 from io import BytesIO
-
+from collections import Counter
+from abc import ABC, abstractmethod
+streastreamlit 
 # ===========================================================
-# PAGE CONFIG
-# ===========================================================
-
-st.set_page_config(page_title="Health Risk Dashboard", layout="wide")
-st.title("🏥 Health Risk Analysis Dashboard")
-
-# ===========================================================
-# KEYWORDS
+# CONFIG
 # ===========================================================
 
-symptoms          = ["fever", "fatigue", "pain", "chills", "nausea", "weak", "headache"]
-worsening_words   = ["worse", "getting worse", "not improving", "deteriorating"]
-duration_words    = ["days", "weeks", "months", "still", "since"]
-treatment_failure = ["not working", "no effect", "antibiotics aren't working", "not helping"]
-positive_words    = ["better", "improving", "recovered"]
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "healthwatch.db")
 
-def quality_check(text, selftext="x"):
-    has_symptom = any(w in text for w in symptoms)
-    has_context = any(w in text for w in duration_words + worsening_words + treatment_failure)
-    long_enough = len(text) > 60
-    not_removed = selftext not in ["[removed]", "[deleted]", ""]
-    return has_symptom and has_context and long_enough
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL   = "claude-sonnet-4-20250514"
+
+# Keywords that trigger heuristic safety / PII flags
+SAFETY_KEYWORDS = [
+    "hospitalized", "hospitalised", "ER", "emergency", "overdose",
+    "suicide", "suicidal", "self-harm", "died", "death", "fatal",
+    "anaphylaxis", "seizure", "stroke", "heart attack", "chest pain",
+    "stopped breathing", "unconscious", "allergic reaction",
+]
+PII_PATTERNS = [
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",   # email
+    r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",                        # phone
+    r"\b\d{3}-\d{2}-\d{4}\b",                                     # SSN
+    r"\b(?:my name is|I am|I'm)\s+[A-Z][a-z]+ [A-Z][a-z]+",      # name disclosure
+]
 
 # ===========================================================
-# FETCH FUNCTIONS
+# DATABASE LAYER
 # ===========================================================
 
-def fetch_reddit(target=100):
-    subreddits = [
-        "AskDocs", "DiagnoseMe", "medical_advice",
-        "Longcovid", "covidlonghaulers", "cfs",
-        "Fibromyalgia", "chronicpain"
-    ]
-    session = requests.Session()
-    session.headers.update({"User-Agent": "HealthRiskScraper/1.0"})
-    posts = []
-    for sub in subreddits:
-        if len(posts) >= target:
-            break
-        try:
-            url = f"https://www.reddit.com/r/{sub}/search.json?q=fever+fatigue&sort=new&limit=25&restrict_sr=1"
-            r = session.get(url, timeout=10)
-            time.sleep(1.5)
-            if r.status_code == 429:
-                time.sleep(10)
-                r = session.get(url, timeout=10)
-            if r.status_code != 200:
-                continue
-            for post in r.json().get("data", {}).get("children", []):
-                if len(posts) >= target:
-                    break
-                p        = post.get("data", {})
-                title    = p.get("title", "")
-                selftext = p.get("selftext", "")
-                if selftext in ["[removed]", "[deleted]", ""]:
-                    continue
-                full_text = (title + " " + selftext).strip().lower()
-                if quality_check(full_text, selftext):
-                    posts.append({
-                        "date":   pd.to_datetime(p.get("created_utc", 0), unit='s').strftime("%Y-%m-%d"),
-                        "source": "Reddit",
-                        "title":  title,
-                        "text":   full_text,
-                        "url":    "https://reddit.com" + p.get("permalink", "")
-                    })
-        except Exception as e:
-            st.warning(f"Reddit r/{sub} error: {e}")
-    return posts
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def fetch_openfda(target=100):
-    searches = [
-        "patient.reaction.reactionmeddrapt:fever",
-        "patient.reaction.reactionmeddrapt:fatigue",
-        "patient.reaction.reactionmeddrapt:pyrexia",
-        "patient.reaction.reactionmeddrapt:chills",
-        "patient.reaction.reactionmeddrapt:asthenia",
-    ]
-    posts = []
-    for search in searches:
-        if len(posts) >= target:
-            break
-        try:
-            url = f"https://api.fda.gov/drug/event.json?search={search}&limit=25"
-            r = requests.get(url, timeout=12)
-            time.sleep(1)
-            if r.status_code != 200:
-                continue
-            for result in r.json().get("results", []):
-                if len(posts) >= target:
-                    break
-                reactions  = result.get("patient", {}).get("reaction", [])
-                drugs      = result.get("patient", {}).get("drug", [])
-                reaction_text = ", ".join([rx.get("reactionmeddrapt", "").lower() for rx in reactions])
-                drug_text     = ", ".join([d.get("medicinalproduct", "").lower() for d in drugs])
-                serious       = result.get("serious", 0)
-                full_text = (
-                    f"patient reported reactions: {reaction_text}. "
-                    f"drugs taken: {drug_text}. "
-                    f"outcome: {'serious' if serious == 1 else 'non-serious'}. "
-                    f"duration unknown since months of treatment."
+def init_db():
+    """Create all tables if they don't exist."""
+    with get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                keywords    TEXT DEFAULT '[]',   -- JSON array
+                sources     TEXT DEFAULT '[]',   -- JSON array
+                created_at  TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS signals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id    INTEGER NOT NULL REFERENCES projects(id),
+                source        TEXT,
+                post_id       TEXT,
+                author        TEXT,
+                title         TEXT,
+                body          TEXT,
+                url           TEXT,
+                fetched_at    TEXT DEFAULT (datetime('now')),
+
+                -- Analysis fields
+                sentiment     TEXT,   -- Positive / Negative / Neutral
+                risk_level    TEXT,   -- High / Medium / Low
+                safety_flag   INTEGER DEFAULT 0,   -- 1 = flagged
+                pii_flagged   INTEGER DEFAULT 0,   -- 1 = flagged
+                adverse_event TEXT,   -- extracted AE description
+                topics        TEXT,   -- JSON array of topic tags
+                summary       TEXT,
+                analyzed_by   TEXT    -- 'claude' or 'heuristic'
+            );
+
+            CREATE TABLE IF NOT EXISTS source_engines (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                name   TEXT UNIQUE NOT NULL,
+                config TEXT DEFAULT '{}'   -- JSON config blob
+            );
+
+            -- Seed default engines if table is empty
+            INSERT OR IGNORE INTO source_engines (name, config) VALUES
+                ('Reddit', '{"base_url": "https://www.reddit.com/search.json", "limit": 25}'),
+                ('Mock',   '{"posts_per_keyword": 5}');
+        """)
+
+
+def get_projects() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_project(project_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_project(name: str, description: str, keywords: list[str], sources: list[str]) -> int:
+    if not name.strip():
+        raise ValueError("Project name cannot be empty.")
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM projects WHERE name=?", (name.strip(),)
+        ).fetchone()
+        if existing:
+            raise ValueError(f"A project named '{name.strip()}' already exists. Choose a different name.")
+        cur = conn.execute(
+            "INSERT INTO projects (name, description, keywords, sources) VALUES (?,?,?,?)",
+            (name.strip(), description, json.dumps(keywords), json.dumps(sources)),
+        )
+        return cur.lastrowid
+
+
+def delete_project(project_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM signals  WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM projects WHERE id=?",         (project_id,))
+
+
+def get_signals(project_id: int) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM signals WHERE project_id=? ORDER BY fetched_at DESC",
+            (project_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_signals(project_id: int, signals: list[dict]):
+    """Upsert signals by (project_id, post_id, source)."""
+    with get_conn() as conn:
+        for s in signals:
+            conn.execute("""
+                INSERT INTO signals
+                    (project_id, source, post_id, author, title, body, url,
+                     sentiment, risk_level, safety_flag, pii_flagged,
+                     adverse_event, topics, summary, analyzed_by)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING
+            """, (
+                project_id,
+                s.get("source"),
+                s.get("post_id"),
+                s.get("author"),
+                s.get("title"),
+                s.get("body"),
+                s.get("url"),
+                s.get("sentiment"),
+                s.get("risk_level"),
+                int(s.get("safety_flag", 0)),
+                int(s.get("pii_flagged", 0)),
+                s.get("adverse_event"),
+                json.dumps(s.get("topics", [])),
+                s.get("summary"),
+                s.get("analyzed_by"),
+            ))
+
+
+def get_source_engines() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM source_engines").fetchall()
+    return [dict(r) for r in rows]
+
+
+# ===========================================================
+# FETCH ENGINES
+# ===========================================================
+
+class BaseEngine(ABC):
+    """Abstract base class for all data-source engines."""
+
+    @abstractmethod
+    def fetch(self, keywords: list[str]) -> list[dict]:
+        """Return a list of raw post dicts."""
+        ...
+
+
+class RedditEngine(BaseEngine):
+    """
+    Fetches posts from Reddit using the public search JSON endpoint.
+    No API key required — uses Reddit's unauthenticated search endpoint.
+    Rate-limited: sleeps 1 s between keyword queries.
+    """
+
+    BASE_URL = "https://www.reddit.com/search.json"
+    HEADERS  = {"User-Agent": "HealthWatch/1.0 (patient-signal-monitor)"}
+
+    def __init__(self, limit: int = 25):
+        self.limit = limit
+
+    def fetch(self, keywords: list[str]) -> list[dict]:
+        posts = []
+        for kw in keywords:
+            try:
+                params = {
+                    "q":     kw,
+                    "sort":  "new",
+                    "limit": self.limit,
+                    "type":  "link",
+                }
+                resp = requests.get(
+                    self.BASE_URL,
+                    params=params,
+                    headers=self.HEADERS,
+                    timeout=10,
                 )
-                receipt_date = result.get("receiptdate", "20240101")
-                try:
-                    date_str = datetime.strptime(receipt_date, "%Y%m%d").strftime("%Y-%m-%d")
-                except:
-                    date_str = "2024-01-01"
-                has_symptom = any(w in full_text for w in symptoms + ["pyrexia", "asthenia", "malaise", "myalgia"])
-                if has_symptom and len(full_text) > 60:
+                resp.raise_for_status()
+                children = resp.json().get("data", {}).get("children", [])
+                for child in children:
+                    d = child.get("data", {})
                     posts.append({
-                        "date":   date_str,
-                        "source": "OpenFDA",
-                        "title":  f"FDA report: {reaction_text[:80]}",
-                        "text":   full_text,
-                        "url":    "https://open.fda.gov/apis/drug/event/"
+                        "source":  "Reddit",
+                        "post_id": d.get("id", ""),
+                        "author":  d.get("author", "[deleted]"),
+                        "title":   d.get("title", ""),
+                        "body":    d.get("selftext", ""),
+                        "url":     f"https://reddit.com{d.get('permalink', '')}",
+                        "subreddit": d.get("subreddit", ""),
+                        "score":   d.get("score", 0),
                     })
-        except Exception as e:
-            st.warning(f"OpenFDA error: {e}")
-    return posts
+                time.sleep(1)   # be polite to Reddit
+            except Exception as exc:
+                st.warning(f"Reddit fetch failed for '{kw}': {exc}")
+        return posts
 
 
-def fetch_pubmed(target=100):
-    queries = [
-        "persistent+fever+fatigue",
-        "low+grade+fever+chronic+fatigue",
-        "post+viral+fatigue+fever",
-        "fever+fatigue+treatment",
-        "fever+fatigue+weeks",
-        "fever+fatigue+pain+weeks",
-        "chronic+fever+fatigue+syndrome",
-        "unexplained+fever+fatigue",
+class MockEngine(BaseEngine):
+    """
+    Generates realistic-looking synthetic posts for demo / offline use.
+    Useful when you don't want to hit any real APIs.
+    """
+
+    TEMPLATES = [
+        "Has anyone else experienced {symptom} after taking {drug}? It's been {days} days.",
+        "My doctor prescribed {drug} last week and now I have {symptom}. Should I be worried?",
+        "Sharing my experience with {drug} — {symptom} started on day {days}.",
+        "Warning: {drug} gave me terrible {symptom}. Ended up in the ER.",
+        "Anyone on {drug} notice {symptom}? Looking for advice.",
+        "Week {days} on {drug}: feeling great, no issues at all.",
+        "Finally {drug} is working for me! No {symptom} this time.",
+        "Switched from {drug} to a generic — {symptom} is much better now.",
     ]
-    posts = []
-    for query in queries:
-        if len(posts) >= target:
-            break
-        try:
-            search_url = (
-                f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-                f"?db=pubmed&term={query}&retmax=15&retmode=json"
-            )
-            r = requests.get(search_url, timeout=10)
-            time.sleep(0.4)
-            if r.status_code != 200:
-                continue
-            ids = r.json().get("esearchresult", {}).get("idlist", [])
-            if not ids:
-                continue
-            fetch_url = (
-                f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-                f"?db=pubmed&id={','.join(ids)}&rettype=abstract&retmode=text"
-            )
-            r2 = requests.get(fetch_url, timeout=10)
-            time.sleep(0.4)
-            if r2.status_code != 200:
-                continue
-            for article in r2.text.strip().split("\n\n\n"):
-                if len(posts) >= target:
-                    break
-                text  = article.strip().lower()
-                lines = [l.strip() for l in article.split("\n") if l.strip()]
-                title = lines[0][:120] if lines else "PubMed Abstract"
-                has_symptom = any(w in text for w in symptoms + ["pyrexia", "malaise", "myalgia", "asthenia"])
-                if has_symptom and len(text) > 60:
-                    posts.append({
-                        "date":   datetime.now().strftime("%Y-%m-%d"),
-                        "source": "PubMed",
-                        "title":  title,
-                        "text":   text,
-                        "url":    "https://pubmed.ncbi.nlm.nih.gov/"
-                    })
-        except Exception as e:
-            st.warning(f"PubMed error: {e}")
-    return posts
+    DRUGS    = ["metformin","atorvastatin","lisinopril","omeprazole","ibuprofen",
+                "sertraline","amoxicillin","levothyroxine","prednisone","gabapentin"]
+    SYMPTOMS = ["nausea","fatigue","headache","dizziness","rash","joint pain",
+                "insomnia","dry mouth","weight gain","shortness of breath"]
+
+    def __init__(self, posts_per_keyword: int = 5):
+        self.ppk = posts_per_keyword
+
+    def fetch(self, keywords: list[str]) -> list[dict]:
+        posts = []
+        for kw in keywords:
+            for i in range(self.ppk):
+                body = random.choice(self.TEMPLATES).format(
+                    drug=random.choice(self.DRUGS),
+                    symptom=random.choice(self.SYMPTOMS),
+                    days=random.randint(1, 30),
+                )
+                posts.append({
+                    "source":  "Mock",
+                    "post_id": f"mock_{kw}_{i}_{random.randint(1000,9999)}",
+                    "author":  f"user_{random.randint(100,999)}",
+                    "title":   f"[{kw}] {body[:60]}",
+                    "body":    body,
+                    "url":     "",
+                })
+        return posts
+
+
+def get_engine(source_name: str) -> BaseEngine:
+    """Factory: return the correct engine for a source name."""
+    engines = {
+        "Reddit": RedditEngine(limit=25),
+        "Mock":   MockEngine(posts_per_keyword=5),
+    }
+    engine = engines.get(source_name)
+    if engine is None:
+        raise ValueError(f"Unknown source engine: '{source_name}'")
+    return engine
+
 
 # ===========================================================
-# RISK FUNCTIONS
+# ANALYSIS — HEURISTICS
 # ===========================================================
 
-def detect_symptoms(text):          return any(w in text for w in symptoms)
-def detect_worsening(text):         return any(w in text for w in worsening_words)
-def detect_duration(text):          return any(w in text for w in duration_words)
-def detect_treatment_failure(text): return any(w in text for w in treatment_failure)
-def detect_positive(text):          return any(w in text for w in positive_words)
+def heuristic_analyze(post: dict) -> dict:
+    """
+    Fast rule-based analysis.  Used as a fallback when Claude is unavailable
+    and as a pre-filter before calling the API.
+    """
+    text = f"{post.get('title','')} {post.get('body','')}".lower()
 
-def calculate_risk(row):
-    score = 0
-    if row['symptom']:           score += 1
-    if row['duration']:          score += 1
-    if row['worsening']:         score += 2
-    if row['treatment_failure']: score += 2
-    if row['positive']:          score -= 1
-    return score
+    # Safety flag
+    safety_flag = any(kw.lower() in text for kw in SAFETY_KEYWORDS)
 
-def classify_risk(score):
-    if score <= 1:   return "Low"
-    elif score <= 3: return "Medium"
-    else:            return "High"
+    # PII flag
+    full_text   = f"{post.get('title','')} {post.get('body','')}"
+    pii_flagged = any(re.search(pat, full_text, re.IGNORECASE) for pat in PII_PATTERNS)
 
-def generate_explanation(row):
-    reasons = []
-    if row['symptom']:           reasons.append("Symptoms detected (+1)")
-    if row['duration']:          reasons.append("Long duration mentioned (+1)")
-    if row['worsening']:         reasons.append("Condition worsening (+2)")
-    if row['treatment_failure']: reasons.append("Treatment not effective (+2)")
-    if row['positive']:          reasons.append("Signs of improvement (-1)")
-    return "; ".join(reasons) if reasons else "No significant indicators"
+    # Sentiment (very simple positive/negative word count)
+    pos_words = ["better","improved","great","good","helped","relief","works","effective","love"]
+    neg_words = ["worse","terrible","awful","pain","side effect","stopped","dangerous","horrible","sick"]
+    pos = sum(1 for w in pos_words if w in text)
+    neg = sum(1 for w in neg_words if w in text)
+    if neg > pos:
+        sentiment = "Negative"
+    elif pos > neg:
+        sentiment = "Positive"
+    else:
+        sentiment = "Neutral"
 
-def risk_meaning(level):
-    if level == "Low":      return "Mild condition, monitor symptoms"
-    elif level == "Medium": return "Moderate concern, consider medical advice"
-    else:                   return "High risk, seek medical attention"
+    # Risk level
+    if safety_flag or neg >= 3:
+        risk_level = "High"
+    elif neg >= 1 or pii_flagged:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
 
-def process(df):
-    df['text'] = df['text'].astype(str).str.lower()
-    df['symptom']           = df['text'].apply(detect_symptoms)
-    df['duration']          = df['text'].apply(detect_duration)
-    df['worsening']         = df['text'].apply(detect_worsening)
-    df['treatment_failure'] = df['text'].apply(detect_treatment_failure)
-    df['positive']          = df['text'].apply(detect_positive)
-    df['risk_score']        = df.apply(calculate_risk, axis=1)
-    df['risk_level']        = df['risk_score'].apply(classify_risk)
-    df['risk_reason']       = df.apply(generate_explanation, axis=1)
-    df['risk_meaning']      = df['risk_level'].apply(risk_meaning)
-    return df
+    # Topic tags
+    topics = []
+    topic_map = {
+        "side effect":   ["side effect","adverse","reaction"],
+        "dosage":        ["dose","dosage","mg","milligram","how much"],
+        "efficacy":      ["works","effective","helped","relief","better"],
+        "discontinuation":["stopped","quit","discontinued","switched"],
+        "safety":        SAFETY_KEYWORDS,
+    }
+    for tag, kws in topic_map.items():
+        if any(k.lower() in text for k in kws):
+            topics.append(tag)
 
-# ===========================================================
-# SIDEBAR — choose mode
-# ===========================================================
-
-st.sidebar.title("⚙️ Data Source")
-mode = st.sidebar.radio("Choose how to load data:", [
-    "📡 Fetch live from Reddit / OpenFDA / PubMed",
-    "📂 Load from saved CSV file"
-])
-
-df = None
-
-# ── Mode 1: Fetch live ─────────────────────────────────────
-if mode == "📡 Fetch live from Reddit / OpenFDA / PubMed":
-    st.sidebar.markdown("---")
-    r_target  = st.sidebar.slider("Reddit posts",  10, 100, 70)
-    fda_target= st.sidebar.slider("OpenFDA posts", 10, 100, 70)
-    pm_target = st.sidebar.slider("PubMed posts",  10, 100, 60)
-
-    if st.sidebar.button("🚀 Fetch Data Now"):
-        with st.spinner("Fetching from Reddit..."):
-            reddit_posts = fetch_reddit(r_target)
-        with st.spinner("Fetching from OpenFDA..."):
-            fda_posts = fetch_openfda(fda_target)
-        with st.spinner("Fetching from PubMed..."):
-            pubmed_posts = fetch_pubmed(pm_target)
-
-        all_posts = reddit_posts + fda_posts + pubmed_posts
-        df = pd.DataFrame(all_posts).drop_duplicates(subset=['text']).reset_index(drop=True)
-        st.session_state['df'] = df
-        st.success(f"✅ Fetched {len(df)} posts total")
-
-    elif 'df' in st.session_state:
-        df = st.session_state['df']
-
-# ── Mode 2: Load from CSV ──────────────────────────────────
-else:
-    st.sidebar.markdown("---")
-    file_path = st.sidebar.text_input(
-        "Paste your CSV file path here:",
-        value=r"C:\Users\khenu\PycharmProjects\PythonProject5\combined_data.csv"
+    # Adverse event extraction (naive)
+    ae_match = re.search(
+        r"(experienced?|developed?|noticed?|got|having?)\s+([\w\s]{3,40})",
+        text, re.IGNORECASE
     )
-    if st.sidebar.button("📂 Load CSV"):
-        try:
-            df = pd.read_csv(file_path)
-            st.session_state['df'] = df
-            st.success(f"✅ Loaded {len(df)} rows")
-        except Exception as e:
-            st.error(f"❌ Could not load file: {e}")
+    adverse_event = ae_match.group(2).strip().title() if ae_match else ""
 
-    elif 'df' in st.session_state:
-        df = st.session_state['df']
+    return {
+        **post,
+        "sentiment":    sentiment,
+        "risk_level":   risk_level,
+        "safety_flag":  safety_flag,
+        "pii_flagged":  pii_flagged,
+        "topics":       topics,
+        "adverse_event": adverse_event,
+        "summary":      (post.get("body") or post.get("title") or "")[:200],
+        "analyzed_by":  "heuristic",
+    }
+
 
 # ===========================================================
-# DASHBOARD — shown once data is loaded
+# ANALYSIS — CLAUDE API
 # ===========================================================
 
-if df is not None and not df.empty:
+ANALYSIS_SYSTEM_PROMPT = """You are a pharmacovigilance analyst. Analyze the social media post below and return ONLY valid JSON (no markdown, no explanation) with these exact keys:
 
-    df = process(df)
+{
+  "sentiment":     "Positive" | "Negative" | "Neutral",
+  "risk_level":    "High" | "Medium" | "Low",
+  "safety_flag":   true | false,
+  "pii_flagged":   true | false,
+  "adverse_event": "<brief description or empty string>",
+  "topics":        ["<tag>", ...],
+  "summary":       "<1-sentence neutral summary>"
+}
 
-    # ── Summary metrics ────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📌 Summary")
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Total Posts",    len(df))
-    col2.metric("🔴 High Risk",   int((df['risk_level'] == 'High').sum()))
-    col3.metric("🟡 Medium Risk", int((df['risk_level'] == 'Medium').sum()))
-    col4.metric("🟢 Low Risk",    int((df['risk_level'] == 'Low').sum()))
+Rules:
+- safety_flag = true if the post describes a serious/life-threatening event, hospitalisation, or suicidal ideation
+- pii_flagged = true if the post contains an email, phone number, full name, or other identifying info
+- risk_level High = serious AE or safety flag; Medium = non-serious AE or symptom report; Low = general discussion
+- topics may include: side effect, efficacy, dosage, discontinuation, safety, mental health, drug interaction
+"""
 
-    # ── Filters ────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🔎 Filter & Explore")
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        risk_filter = st.multiselect("Risk Level", ["Low", "Medium", "High"], default=["Low", "Medium", "High"])
-    with col_b:
-        if 'source' in df.columns:
-            source_filter = st.multiselect("Source", df['source'].unique().tolist(), default=df['source'].unique().tolist())
+def claude_analyze(post: dict, api_key: str) -> dict:
+    """
+    Call the Claude API to analyze a post.
+    Returns enriched post dict, or falls back to heuristics on error.
+    """
+    text = f"Title: {post.get('title','')}\n\nBody: {post.get('body','')}"
+    payload = {
+        "model":      CLAUDE_MODEL,
+        "max_tokens": 512,
+        "system":     ANALYSIS_SYSTEM_PROMPT,
+        "messages":   [{"role": "user", "content": text}],
+    }
+    headers = {
+        "x-api-key":         api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type":      "application/json",
+    }
+    try:
+        resp = requests.post(CLAUDE_API_URL, json=payload, headers=headers, timeout=20)
+        resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
+        # Strip markdown fences if present
+        raw = re.sub(r"^```json\s*|```$", "", raw, flags=re.MULTILINE).strip()
+        result = json.loads(raw)
+        return {
+            **post,
+            "sentiment":    result.get("sentiment", "Neutral"),
+            "risk_level":   result.get("risk_level", "Low"),
+            "safety_flag":  bool(result.get("safety_flag", False)),
+            "pii_flagged":  bool(result.get("pii_flagged", False)),
+            "adverse_event": result.get("adverse_event", ""),
+            "topics":       result.get("topics", []),
+            "summary":      result.get("summary", ""),
+            "analyzed_by":  "claude",
+        }
+    except Exception as exc:
+        st.warning(f"Claude analysis failed ({exc}), falling back to heuristics.")
+        return heuristic_analyze(post)
+
+
+def analyze_batch(posts: list[dict], api_key: str | None = None) -> list[dict]:
+    """
+    Analyze a batch of posts.
+    Uses Claude if api_key provided, heuristics otherwise.
+    Shows a progress bar in the Streamlit UI.
+    """
+    results = []
+    bar = st.progress(0, text="Analysing posts…")
+    n   = len(posts)
+    for i, post in enumerate(posts):
+        if api_key:
+            results.append(claude_analyze(post, api_key))
+            time.sleep(0.3)   # gentle rate limiting
         else:
-            source_filter = None
+            results.append(heuristic_analyze(post))
+        bar.progress((i + 1) / max(n, 1), text=f"Analysing {i+1}/{n}")
+    bar.empty()
+    return results
 
-    filtered_df = df[df['risk_level'].isin(risk_filter)]
-    if source_filter and 'source' in df.columns:
-        filtered_df = filtered_df[filtered_df['source'].isin(source_filter)]
 
-    cols = ['date', 'source', 'title', 'risk_score', 'risk_level', 'risk_reason', 'risk_meaning'] \
-        if 'source' in df.columns else \
-        ['date', 'title', 'risk_score', 'risk_level', 'risk_reason', 'risk_meaning']
+# ===========================================================
+# APP UI
+# ===========================================================
 
-    st.dataframe(filtered_df[cols], use_container_width=True, height=300)
+init_db()
+st.set_page_config(page_title="HealthWatch", layout="wide", page_icon="🏥")
 
-    st.download_button("📥 Download output.csv",
-                       filtered_df.to_csv(index=False).encode('utf-8'),
-                       "output.csv", "text/csv")
+st.markdown("""<style>
+.safety-flag{background:#ff000022;border-left:4px solid red;padding:8px;border-radius:4px;margin:4px 0}
+.pii-flag{background:#ff990022;border-left:4px solid orange;padding:8px;border-radius:4px;margin:4px 0}
+</style>""", unsafe_allow_html=True)
 
-    # ── Charts ─────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📈 Visualizations")
+st.sidebar.image("https://img.icons8.com/color/96/stethoscope.png", width=60)
+st.sidebar.title("HealthWatch")
+st.sidebar.markdown("*Real-Time Patient Signal Monitor*")
+st.sidebar.markdown("---")
 
-    fig = plt.figure(figsize=(18, 14))
-    fig.suptitle("Health Risk Analysis Dashboard", fontsize=16, fontweight='bold', y=0.98)
-    gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.35)
-
-    ax1 = fig.add_subplot(gs[0, :])
-    if 'date' in df.columns:
-        df['date']    = pd.to_datetime(df['date'], errors='coerce')
-        df_sorted     = df.dropna(subset=['date']).sort_values('date').copy()
-        df_sorted.set_index('date', inplace=True)
-        weekly        = df_sorted['risk_score'].resample('W').mean()
-        smoothed      = weekly.rolling(window=3, min_periods=1).mean()
-        ax1.fill_between(weekly.index, 0, 1, alpha=0.08, color='green',  label='Low zone')
-        ax1.fill_between(weekly.index, 1, 3, alpha=0.08, color='orange', label='Medium zone')
-        ax1.fill_between(weekly.index, 3, 6, alpha=0.08, color='red',    label='High zone')
-        ax1.plot(weekly.index,   weekly.values,   'o-', color='steelblue',  linewidth=1.5, markersize=4, label='Weekly avg')
-        ax1.plot(smoothed.index, smoothed.values, '-',  color='darkorange', linewidth=2.5, label='Smoothed trend')
-        ax1.axhline(y=1, color='green', linestyle='--', linewidth=0.8, alpha=0.5)
-        ax1.axhline(y=3, color='red',   linestyle='--', linewidth=0.8, alpha=0.5)
-        ax1.set_xlabel("Date"); ax1.set_ylabel("Avg Risk Score")
-        ax1.set_title("Risk Trend Over Time (Weekly)", fontweight='bold')
-        ax1.legend(fontsize=9); ax1.set_ylim(0, 6)
-
-    ax2 = fig.add_subplot(gs[1, 0])
-    counts     = df['risk_level'].value_counts()
-    colors_map = {'Low': '#4CAF50', 'Medium': '#FF9800', 'High': '#F44336'}
-    wedges, texts, autotexts = ax2.pie(
-        counts.values, labels=counts.index, autopct='%1.1f%%',
-        colors=[colors_map.get(l, 'grey') for l in counts.index],
-        startangle=140, textprops={'fontsize': 11}
+# Optional Claude API key in sidebar
+with st.sidebar.expander("🔑 Claude API Key (optional)"):
+    api_key_input = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        placeholder="sk-ant-…",
+        help="Leave blank to use heuristic-only analysis.",
     )
-    for at in autotexts: at.set_fontweight('bold')
-    ax2.set_title("Risk Level Distribution", fontweight='bold')
+st.sidebar.markdown("---")
 
-    ax3 = fig.add_subplot(gs[1, 1])
-    ax3.hist(df['risk_score'],
-             bins=range(int(df['risk_score'].min()), int(df['risk_score'].max()) + 2),
-             color='steelblue', edgecolor='white', linewidth=0.8, rwidth=0.8)
-    ax3.axvspan(df['risk_score'].min() - 0.5, 1.5, alpha=0.08, color='green')
-    ax3.axvspan(1.5, 3.5,                           alpha=0.08, color='orange')
-    ax3.axvspan(3.5, df['risk_score'].max() + 0.5,  alpha=0.08, color='red')
-    ax3.set_xlabel("Risk Score"); ax3.set_ylabel("Number of Posts")
-    ax3.set_title("Risk Score Distribution", fontweight='bold')
-    for rect in ax3.patches:
-        h = rect.get_height()
-        if h > 0:
-            ax3.text(rect.get_x() + rect.get_width()/2., h + 0.3, f'{int(h)}',
-                     ha='center', va='bottom', fontsize=9, fontweight='bold')
+page = st.sidebar.radio(
+    "Navigate",
+    ["🏠 Dashboard", "📁 Projects", "🔍 Run Analysis", "📊 Signals & Trends", "⚙️ Admin"],
+)
 
-    st.pyplot(fig)
+# ── DASHBOARD ───────────────────────────────────────────────
+if page == "🏠 Dashboard":
+    st.title("🏥 HealthWatch — Patient Signal Monitor")
+    st.markdown("Real-time social listening for adverse events, treatment signals & patient safety.")
 
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches='tight')
-    st.download_button("📥 Download Dashboard PNG", buf.getvalue(), "risk_dashboard.png", "image/png")
+    projects = get_projects()
+    if not projects:
+        st.info("👈 Create your first project in **📁 Projects** to get started.")
+    else:
+        all_signals = []
+        for p in projects:
+            all_signals.extend(get_signals(p["id"]))
 
-else:
-    st.info("👈 Use the sidebar to fetch live data or load a CSV file.")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("📁 Projects",    len(projects))
+        c2.metric("📨 Total Signals", len(all_signals))
+        c3.metric("🔴 High Risk",   sum(1 for s in all_signals if s.get("risk_level") == "High"))
+        c4.metric("⚠️ Safety Flags", sum(1 for s in all_signals if s.get("safety_flag") == 1))
+        c5.metric("🔒 PII",          sum(1 for s in all_signals if s.get("pii_flagged") == 1))
+
+        if all_signals:
+            st.markdown("---")
+            st.subheader("Recent High-Risk Signals")
+            high_risk = [s for s in all_signals if s.get("risk_level") == "High"][:10]
+            for s in high_risk:
+                with st.expander(f"🔴 {s.get('title','(no title)')[:80]}"):
+                    st.write(s.get("summary") or s.get("body","")[:300])
+                    cols = st.columns(4)
+                    cols[0].write(f"**Source:** {s.get('source')}")
+                    cols[1].write(f"**Sentiment:** {s.get('sentiment')}")
+                    cols[2].write(f"**AE:** {s.get('adverse_event') or '—'}")
+                    cols[3].write(f"**By:** {s.get('analyzed_by')}")
+                    if s.get("url"):
+                        st.markdown(f"[View original post]({s['url']})")
+
+
+# ── PROJECTS ────────────────────────────────────────────────
+elif page == "📁 Projects":
+    st.title("📁 Project Management")
+    available_sources = [e["name"] for e in get_source_engines()]
+
+    with st.form("create_project_form"):
+        st.subheader("Create New Project")
+        name         = st.text_input("Project Name *")
+        description  = st.text_area("Description", height=80)
+        keywords_raw = st.text_input("Keywords * (comma-separated)", placeholder="metformin, diabetes, side effects")
+        sources      = st.multiselect("Data Sources", available_sources, default=["Mock"])
+        submitted    = st.form_submit_button("➕ Create Project")
+        if submitted:
+            if not name.strip():
+                st.error("Project name is required.")
+            elif not keywords_raw.strip():
+                st.error("At least one keyword is required.")
+            else:
+                kws = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+                try:
+                    pid = create_project(name, description, kws, sources)
+                    st.success(f"✅ Project **{name}** created (ID: {pid})")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+    st.markdown("---")
+    st.subheader("Existing Projects")
+    projects = get_projects()
+    if not projects:
+        st.info("No projects yet.")
+    else:
+        for p in projects:
+            with st.expander(f"📁 {p['name']}  (ID {p['id']})"):
+                cols = st.columns([2, 2, 1])
+                cols[0].write(f"**Keywords:** {', '.join(json.loads(p.get('keywords','[]')))}")
+                cols[1].write(f"**Sources:** {', '.join(json.loads(p.get('sources','[]')))}")
+                signals = get_signals(p["id"])
+                cols[2].write(f"**Signals:** {len(signals)}")
+                if st.button(f"🗑️ Delete project {p['id']}", key=f"del_{p['id']}"):
+                    delete_project(p["id"])
+                    st.rerun()
+
+
+# ── RUN ANALYSIS ────────────────────────────────────────────
+elif page == "🔍 Run Analysis":
+    st.title("🔍 Run Analysis")
+
+    projects = get_projects()
+    if not projects:
+        st.warning("No projects found. Create one first in 📁 Projects.")
+    else:
+        project_names = {p["name"]: p for p in projects}
+        selected_name = st.selectbox("Select Project", list(project_names.keys()))
+        project       = project_names[selected_name]
+        keywords      = json.loads(project.get("keywords", "[]"))
+        sources       = json.loads(project.get("sources", "[]"))
+
+        st.markdown(f"**Keywords:** {', '.join(keywords)}  |  **Sources:** {', '.join(sources)}")
+
+        use_claude = bool(api_key_input)
+        if use_claude:
+            st.success("✅ Claude API key detected — using AI analysis.")
+        else:
+            st.info("ℹ️ No API key — using heuristic analysis. Add your key in the sidebar for AI-powered results.")
+
+        if st.button("🚀 Fetch & Analyse"):
+            all_posts = []
+            with st.status("Fetching posts…", expanded=True) as status:
+                for src in sources:
+                    st.write(f"Fetching from **{src}**…")
+                    try:
+                        engine = get_engine(src)
+                        fetched = engine.fetch(keywords)
+                        st.write(f"→ {len(fetched)} posts retrieved from {src}")
+                        all_posts.extend(fetched)
+                    except Exception as e:
+                        st.error(f"Engine error for {src}: {e}")
+                status.update(label=f"Fetched {len(all_posts)} posts total.", state="complete")
+
+            if all_posts:
+                analyzed = analyze_batch(all_posts, api_key=api_key_input or None)
+                save_signals(project["id"], analyzed)
+                st.success(f"✅ Saved {len(analyzed)} signals for project **{selected_name}**.")
+
+                # Quick summary
+                high = sum(1 for a in analyzed if a.get("risk_level") == "High")
+                flags = sum(1 for a in analyzed if a.get("safety_flag"))
+                st.metric("High-risk signals", high)
+                st.metric("Safety flags",      flags)
+            else:
+                st.warning("No posts were fetched. Check keywords and sources.")
+
+
+# ── SIGNALS & TRENDS ────────────────────────────────────────
+elif page == "📊 Signals & Trends":
+    st.title("📊 Signals & Trends")
+
+    projects = get_projects()
+    if not projects:
+        st.stop()
+
+    project_names = {p["name"]: p for p in projects}
+    selected_name = st.selectbox("Project", list(project_names.keys()))
+    project       = project_names[selected_name]
+    signals       = get_signals(project["id"])
+
+    if not signals:
+        st.info("No signals yet. Run an analysis first.")
+        st.stop()
+
+    df = pd.DataFrame(signals)
+    # Parse topics from JSON string back to list if needed
+    if "topics" in df.columns:
+        df["topics"] = df["topics"].apply(
+            lambda t: json.loads(t) if isinstance(t, str) else (t or [])
+        )
+
+    # ── Filters
+    with st.expander("🔽 Filters", expanded=False):
+        fc1, fc2, fc3 = st.columns(3)
+        risk_filter   = fc1.multiselect("Risk Level",  ["High","Medium","Low"], default=["High","Medium","Low"])
+        sent_filter   = fc2.multiselect("Sentiment",   ["Positive","Negative","Neutral"],
+                                        default=["Positive","Negative","Neutral"])
+        source_filter = fc3.multiselect("Source",
+                                        df["source"].dropna().unique().tolist(),
+                                        default=df["source"].dropna().unique().tolist())
+        safety_only   = st.checkbox("Show safety-flagged only")
+        pii_only      = st.checkbox("Show PII-flagged only")
+
+    mask = (
+        df["risk_level"].isin(risk_filter) &
+        df["sentiment"].isin(sent_filter) &
+        df["source"].isin(source_filter)
+    )
+    if safety_only: mask &= df["safety_flag"] == 1
+    if pii_only:    mask &= df["pii_flagged"] == 1
+    filtered = df[mask]
+
+    st.markdown(f"**{len(filtered)} signals** match current filters.")
+
+    # ── Charts
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        rc = filtered["risk_level"].value_counts()
+        fig, ax = plt.subplots(figsize=(3.5, 3))
+        colors = {"High": "#e74c3c", "Medium": "#f39c12", "Low": "#2ecc71"}
+        ax.pie(rc, labels=rc.index, autopct="%1.0f%%",
+               colors=[colors.get(k, "#999") for k in rc.index])
+        ax.set_title("Risk Levels")
+        st.pyplot(fig, use_container_width=True)
+        plt.close()
+
+    with col2:
+        sc = filtered["sentiment"].value_counts()
+        fig, ax = plt.subplots(figsize=(3.5, 3))
+        ax.bar(sc.index, sc.values,
+               color=["#2ecc71" if s=="Positive" else "#e74c3c" if s=="Negative" else "#95a5a6"
+                      for s in sc.index])
+        ax.set_title("Sentiment")
+        ax.set_ylabel("Count")
+        st.pyplot(fig, use_container_width=True)
+        plt.close()
+
+    with col3:
+        all_topics = [t for row in filtered["topics"] for t in (row if isinstance(row, list) else [])]
+        tc = Counter(all_topics).most_common(8)
+        if tc:
+            fig, ax = plt.subplots(figsize=(3.5, 3))
+            labels, vals = zip(*tc)
+            ax.barh(labels, vals, color="#3498db")
+            ax.set_title("Top Topics")
+            ax.invert_yaxis()
+            st.pyplot(fig, use_container_width=True)
+            plt.close()
+
+    # ── Data table
+    st.markdown("---")
+    st.subheader("Signal Table")
+    display_cols = ["source","title","sentiment","risk_level","safety_flag","pii_flagged","adverse_event","analyzed_by"]
+    available    = [c for c in display_cols if c in filtered.columns]
+    st.dataframe(
+        filtered[available].reset_index(drop=True),
+        use_container_width=True,
+        height=400,
+    )
+
+    # ── CSV download
+    csv = filtered.drop(columns=["id","project_id"], errors="ignore").to_csv(index=False)
+    st.download_button("⬇️ Download CSV", csv, "signals.csv", "text/csv")
+
+
+# ── ADMIN ───────────────────────────────────────────────────
+elif page == "⚙️ Admin":
+    st.title("⚙️ Admin")
+
+    st.subheader("Registered Source Engines")
+    for e in get_source_engines():
+        with st.expander(f"🔧 {e['name']}"):
+            try:
+                cfg = json.loads(e.get("config", "{}"))
+            except Exception:
+                cfg = {}
+            st.json(cfg)
+
+    st.markdown("---")
+    st.subheader("Database Stats")
+    with get_conn() as conn:
+        n_proj = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+        n_sig  = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        n_high = conn.execute("SELECT COUNT(*) FROM signals WHERE risk_level='High'").fetchone()[0]
+        n_flag = conn.execute("SELECT COUNT(*) FROM signals WHERE safety_flag=1").fetchone()[0]
+
+    cols = st.columns(4)
+    cols[0].metric("Projects", n_proj)
+    cols[1].metric("Signals",  n_sig)
+    cols[2].metric("High Risk", n_high)
+    cols[3].metric("Safety Flagged", n_flag)
+
+    st.markdown("---")
+    st.subheader("⚠️ Danger Zone")
+    if st.button("🗑️ Clear ALL signals (keep projects)"):
+        with get_conn() as conn:
+            conn.execute("DELETE FROM signals")
+        st.success("All signals deleted.")
+        st.rerun()
