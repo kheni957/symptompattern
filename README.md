@@ -166,3 +166,5 @@ Go to **🔍 Run Analysis → Upload CSV tab** to analyse your own data without 
 **Claude AI option greyed out** — the `anthropic` package is not installed; follow the Claude AI setup steps above
 
 **Database errors** — delete `healthwatch.db` and restart
+
+**Fetched 0 total posts** — some networks (especially university or corporate WiFi) block API requests. Try switching to a mobile hotspot — this often resolves it instantly.
