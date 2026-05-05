@@ -303,7 +303,7 @@ class StackExchangeHealthEngine(BaseEngine):
                         "order":    "desc",
                         "sort":     "activity",
                         "intitle":  kw,
-                        "site":     "health",
+                        "site":     "medicalsciences",
                         "pagesize": 20,
                     },
                     timeout=15,
