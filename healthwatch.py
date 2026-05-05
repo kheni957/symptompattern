@@ -146,11 +146,12 @@ def init_db():
             );
             INSERT OR IGNORE INTO source_engines (name, config) VALUES
                 ('Reddit',        '{"subreddits": ["AskDocs","DiagnoseMe","medical_advice","Longcovid","covidlonghaulers","cfs","Fibromyalgia","chronicpain"], "limit": 25}'),
-                ('PubMed',        '{"max_results": 10}'),
-                ('OpenFDA',       '{"max_results": 20}'),
-                ('ClinicalTrials','{"max_results": 10}'),
-                ('MedlinePlus',   '{"max_results": 10}'),
-                ('Twitter',       '{"max_results": 20}');
+                ('StackExchangeHealth', '{}'),          
+                ('PubMed',        '{"max_results": 50}'),
+                ('OpenFDA',       '{"max_results": 50}'),
+                ('ClinicalTrials','{"max_results": 50}'),
+                ('MedlinePlus',   '{"max_results": 50}'),
+                ('Twitter',       '{"max_results": 50}');
         """)
 
 def get_projects():
@@ -289,6 +290,46 @@ class RedditEngine(BaseEngine):
                 print(f"Reddit r/{sub}: {e}")
         return posts
 
+class StackExchangeHealthEngine(BaseEngine):
+    name = "StackExchangeHealth"
+
+    def fetch(self, keywords):
+        posts = []
+        for kw in keywords[:4]:
+            try:
+                resp = requests.get(
+                    "https://api.stackexchange.com/2.3/search",
+                    params={
+                        "order":    "desc",
+                        "sort":     "activity",
+                        "intitle":  kw,
+                        "site":     "health",
+                        "pagesize": 20,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                for item in resp.json().get("items", []):
+                    title = item.get("title", "")
+                    url_  = item.get("link", "")
+                    tags  = ", ".join(item.get("tags", []))
+                    body  = f"Tags: {tags}. Score: {item.get('score', 0)}. Answers: {item.get('answer_count', 0)}."
+                    ts    = item.get("creation_date", 0)
+                    post_date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else datetime.now().strftime("%Y-%m-%d")
+                    uid   = item.get("question_id", str(random.randint(100000, 999999)))
+                    posts.append({
+                        "source":    "StackExchangeHealth",
+                        "post_id":   f"sx_{uid}",
+                        "author":    item.get("owner", {}).get("display_name", "Community Member"),
+                        "title":     title[:200],
+                        "body":      body,
+                        "url":       url_,
+                        "post_date": post_date,
+                    })
+                time.sleep(0.5)
+            except Exception as e:
+                st.warning(f"⚠️ StackExchangeHealth failed for '{kw}': {e}")
+        return posts
 
 class PubMedEngine(BaseEngine):
     name = "PubMed"
@@ -552,6 +593,7 @@ class TwitterEngine(BaseEngine):
 
 ENGINES = {
     "Reddit":        RedditEngine,
+    "StackExchangeHealth": StackExchangeHealthEngine,
     "PubMed":        PubMedEngine,
     "OpenFDA":       OpenFDAEngine,
     "ClinicalTrials": ClinicalTrialsEngine,
