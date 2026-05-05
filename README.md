@@ -73,16 +73,17 @@ The database is recreated automatically on startup.
 
 ## Data Sources
 
-| Source | Type | API Key Required |
-|--------|------|-----------------|
-| Reddit | Patient forums | No |
-| PubMed | Biomedical research abstracts | No |
-| OpenFDA | FDA adverse event reports | No |
-| ClinicalTrials | Completed clinical studies | No |
-| MedlinePlus | NIH health topics | No |
-| Twitter / X | Real-time patient posts | Yes — twitterapi.io |
+| Source | Type | API Key Required | Deployment |
+|--------|------|-----------------|------------|
+| Reddit | Patient forums | No | Local only |
+| PubMed | Biomedical research abstracts | No | Local & Cloud |
+| OpenFDA | FDA adverse event reports | No | Local & Cloud |
+| ClinicalTrials | Completed clinical studies | No | Local & Cloud |
+| MedlinePlus | NIH health topics | No | Local & Cloud |
+| Medical Sciences Stack Exchange | People Q&A health forum | No | Local & Cloud |
+| Twitter / X | Real-time patient posts | Yes — twitterapi.io | Local & Cloud |
 
-Reddit, PubMed, OpenFDA, ClinicalTrials, and MedlinePlus are all free with no account needed. Twitter requires a key from [twitterapi.io](https://twitterapi.io) (see below).
+> ⚠️ **Reddit is for local deployment only.** Reddit blocks requests from cloud servers. When using the hosted app, use **Medical Sciences Stack Exchange** as your people forum source alongside PubMed and OpenFDA.
 
 ---
 
@@ -116,7 +117,9 @@ The key is session-only and never saved to disk.
 ## Getting Started
 
 1. Go to **📁 Projects** → create a project with keywords (e.g. `ibuprofen, side effects, pain`)
-2. Select data sources (Reddit + OpenFDA recommended for starters; add PubMed for broader coverage)
+2. Select data sources:
+   - **Local:** Reddit + OpenFDA recommended for starters
+   - **Cloud:** Medical Sciences Stack Exchange + OpenFDA + PubMed recommended
 3. Go to **🔍 Run Analysis** → select your project → click **Start Fetch & Analysis**
 4. View results in **📊 Signals & Trends**
 
@@ -134,9 +137,11 @@ Go to **🔍 Run Analysis → Upload CSV tab** to analyse your own data without 
 
 **No signals found** — try broader keywords (single words like `ibuprofen` work better than phrases)
 
-**Reddit returns 0 posts** — Reddit rate-limits aggressively; wait 60 seconds and try again
+**Reddit returns 0 posts** — Reddit is only supported in local deployment; switch to Medical Sciences Stack Exchange on the cloud version. If running locally, Reddit rate-limits aggressively — wait 60 seconds and try again
 
 **PubMed returns 0 posts** — NCBI rate-limits to ~3 requests/second; wait 60 seconds and retry with simpler keywords
+
+**MedlinePlus warning on startup** — occasional DNS/network issue on MedlinePlus's server; the app will skip it automatically and retry next run
 
 **Twitter returns 0 posts** — check that your twitterapi.io key is entered in the sidebar; if rate-limited, wait a few minutes
 
