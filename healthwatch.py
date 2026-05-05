@@ -1605,6 +1605,30 @@ def score_risk(text, sentiment_label, safety_flag, source=""):
 # SAFETY DETECTION — word-boundary matching
 # ===========================================================
 
+def get_risk_score_breakdown(row):
+    text = f"{row.get('title', '')} {row.get('body', '')}".strip().lower()
+    parts = []
+    source_discount = 15 if row.get("source", "") in ("PubMed", "ClinicalTrials", "OpenFDA") else 0
+    if row.get("safety_flag") == 1:
+        parts.append(f"+{RISK_WEIGHTS['safety_keyword']} safety keyword")
+    if any(w in text for w in FAILURE_KW):
+        parts.append(f"+{RISK_WEIGHTS['treatment_failure']} treatment failure")
+    if any(w in text for w in WORSENING_KW):
+        parts.append(f"+{RISK_WEIGHTS['worsening']} worsening")
+    if any(w in text for w in MODERATE_AE_WORDS):
+        parts.append(f"+{RISK_WEIGHTS['moderate_ae']} moderate adverse event")
+    if any(w in text for w in SYMPTOM_KW):
+        parts.append(f"+{RISK_WEIGHTS['symptom']} symptom present")
+    if any(w in text for w in DURATION_KW):
+        parts.append(f"+{RISK_WEIGHTS['duration']} prolonged duration")
+    if row.get("sentiment") == "Negative":
+        parts.append(f"+{RISK_WEIGHTS['negative_sentiment']} negative sentiment")
+    if any(w in text for w in POSITIVE_KW) and not row.get("safety_flag"):
+        parts.append("-8 positive signals")
+    if source_discount:
+        parts.append(f"-{source_discount} academic source discount")
+    return "; ".join(parts) if parts else "no indicators"
+
 def detect_safety(text):
     t = text.lower()
     triggers = []
@@ -2257,9 +2281,12 @@ elif page == "📊 Signals & Trends":
 
     st.markdown("---")
     st.subheader("📋 All Signals")
+    fdf = fdf.copy()
+    fdf["risk_score_breakdown"] = fdf.apply(get_risk_score_breakdown, axis=1)
     display_cols = [c for c in ["post_date", "source", "title", "sentiment", "risk_level",
-                                 "risk_score", "safety_flag", "pii_flagged", "adverse_event", "analyzed_by"] if c in fdf.columns]
+                                 "risk_score", "risk_score_breakdown", "safety_flag", "pii_flagged", "adverse_event", "analyzed_by"] if c in fdf.columns]
     st.dataframe(fdf[display_cols].head(100), use_container_width=True, height=400)
+    
     csv = fdf.drop(columns=["id", "project_id"], errors="ignore").to_csv(index=False)
     st.download_button("📥 Download CSV", csv, f"{project['name']}_signals.csv", "text/csv")
 
