@@ -31,7 +31,13 @@ matplotlib>=3.7.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 python-dotenv>=1.0.0
+# anthropic>=0.25.0
 ```
+
+> **To enable Claude AI Analysis:** open `requirements.txt`, remove the `#` at the start of the `anthropic` line, then re-run:
+> ```bash
+> pip install -r requirements.txt
+> ```
 
 ---
 
@@ -74,10 +80,9 @@ The database is recreated automatically on startup.
 | OpenFDA | FDA adverse event reports | No |
 | ClinicalTrials | Completed clinical studies | No |
 | MedlinePlus | NIH health topics | No |
-| HealthBoards | Patient discussion forum | No |
 | Twitter / X | Real-time patient posts | Yes — twitterapi.io |
 
-Reddit, PubMed, OpenFDA, ClinicalTrials, MedlinePlus, and HealthBoards are all free with no account needed. Twitter requires a key from [twitterapi.io](https://twitterapi.io) (see below).
+Reddit, PubMed, OpenFDA, ClinicalTrials, and MedlinePlus are all free with no account needed. Twitter requires a key from [twitterapi.io](https://twitterapi.io) (see below).
 
 ---
 
@@ -98,9 +103,11 @@ By default the app runs in **heuristic mode** (free, no key needed).
 
 To enable Claude AI-powered analysis:
 
-1. Get an API key from [console.anthropic.com](https://console.anthropic.com)
-2. Paste it into the **Anthropic API Key** field in the sidebar
-3. Check **Enable Claude AI Analysis**
+1. Open `requirements.txt` and remove the `#` before `anthropic>=0.25.0`
+2. Run `pip install -r requirements.txt`
+3. Get an API key from [console.anthropic.com](https://console.anthropic.com)
+4. Paste it into the **Anthropic API Key** field in the sidebar
+5. Check **Enable Claude AI Analysis**
 
 The key is session-only and never saved to disk.
 
@@ -109,7 +116,7 @@ The key is session-only and never saved to disk.
 ## Getting Started
 
 1. Go to **📁 Projects** → create a project with keywords (e.g. `ibuprofen, side effects, pain`)
-2. Select data sources (Reddit + OpenFDA recommended for starters; add PubMed or HealthBoards for broader coverage)
+2. Select data sources (Reddit + OpenFDA recommended for starters; add PubMed for broader coverage)
 3. Go to **🔍 Run Analysis** → select your project → click **Start Fetch & Analysis**
 4. View results in **📊 Signals & Trends**
 
@@ -131,8 +138,8 @@ Go to **🔍 Run Analysis → Upload CSV tab** to analyse your own data without 
 
 **PubMed returns 0 posts** — NCBI rate-limits to ~3 requests/second; wait 60 seconds and retry with simpler keywords
 
-**HealthBoards returns 0 posts** — the site occasionally blocks scrapers; wait a minute and try again
-
 **Twitter returns 0 posts** — check that your twitterapi.io key is entered in the sidebar; if rate-limited, wait a few minutes
+
+**Claude AI option greyed out** — the `anthropic` package is not installed; follow the Claude AI setup steps above
 
 **Database errors** — delete `healthwatch.db` and restart

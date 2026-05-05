@@ -150,7 +150,6 @@ def init_db():
                 ('OpenFDA',       '{"max_results": 20}'),
                 ('ClinicalTrials','{"max_results": 10}'),
                 ('MedlinePlus',   '{"max_results": 10}'),
-                ('HealthBoards',  '{"max_results": 15}'),
                 ('Twitter',       '{"max_results": 20}');
         """)
 
@@ -335,6 +334,7 @@ class PubMedEngine(BaseEngine):
                     ab_el    = article.find(".//AbstractText")
                     body     = ab_el.text if ab_el is not None else ""
                     full     = ((title or "") + " " + (body or "")).strip()
+                    full = ((title or "") + " " + (body or "")).strip()
                     if self._is_non_human(full):
                         continue
                     posts.append({
@@ -375,6 +375,7 @@ class MedlinePlusEngine(BaseEngine):
                     url     = doc.get("url", "")
                     title   = ""
                     snippet = ""
+                    
                     for content in doc.findall("content"):
                         n = content.get("name", "")
                         text = re.sub(r"<[^>]+>", "", content.text or "").strip()
@@ -549,78 +550,12 @@ class TwitterEngine(BaseEngine):
         return posts
 
 
-class HealthBoardsEngine(BaseEngine):
-    name = "HealthBoards"
-    HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    BASE = "https://www.healthboards.com/boards/search.php"
-
-    def __init__(self, max_results=15):
-        self.max_results = max_results
-
-    def fetch(self, keywords):
-        posts = []
-        for kw in keywords[:3]:
-            try:
-                resp = requests.get(
-                    self.BASE,
-                    params={"query": kw, "action": "results", "searchdate": "0", "order": "descdate"},
-                    headers=self.HEADERS,
-                    timeout=15,
-                )
-                if resp.status_code != 200:
-                    continue
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # Try several selector patterns for thread titles
-                results = (
-                    soup.find_all("div", class_=re.compile(r"searchresult", re.I)) or
-                    soup.find_all("h3", class_=re.compile(r"thread|title", re.I)) or
-                    soup.select("ol.searchresults li") or
-                    soup.find_all("a", href=re.compile(r"/boards/\w+/\d+"))
-                )
-                seen = set()
-                for result in results[:self.max_results * 2]:
-                    # Grab link + title
-                    link_el = result if result.name == "a" else result.find("a", href=re.compile(r"/boards/"))
-                    if not link_el:
-                        continue
-                    title = link_el.get_text(strip=True)
-                    url   = link_el.get("href", "")
-                    if not url.startswith("http"):
-                        url = "https://www.healthboards.com" + url
-                    if not title or len(title) < 10 or url in seen:
-                        continue
-                    seen.add(url)
-                    # Snippet / body text
-                    snippet_el = (
-                        result.find("div", class_=re.compile(r"snippet|content|post|body", re.I))
-                        if result.name != "a" else None
-                    )
-                    body = snippet_el.get_text(" ", strip=True) if snippet_el else title
-                    uid  = abs(hash(url + kw))
-                    posts.append({
-                        "source":    "HealthBoards",
-                        "post_id":   f"hb_{uid}",
-                        "author":    "HealthBoards User",
-                        "title":     title[:200],
-                        "body":      body[:800],
-                        "url":       url,
-                        "post_date": datetime.now().strftime("%Y-%m-%d"),
-                    })
-                    if len(posts) >= self.max_results:
-                        break
-                time.sleep(1)
-            except Exception as e:
-                st.warning(f"⚠️ HealthBoards failed for '{kw}': {e}")
-        return posts
-
-
 ENGINES = {
     "Reddit":        RedditEngine,
     "PubMed":        PubMedEngine,
     "OpenFDA":       OpenFDAEngine,
     "ClinicalTrials": ClinicalTrialsEngine,
     "MedlinePlus":   MedlinePlusEngine,
-    "HealthBoards":  HealthBoardsEngine,
     "Twitter":       TwitterEngine,
 }
 
@@ -693,29 +628,579 @@ def analyze_sentiment(text):
 # ENTITY EXTRACTION
 # ===========================================================
 
+# ============================================================================
+# DRUGS / MEDICATIONS
+# ============================================================================
 DRUG_LIST = [
-    "ibuprofen", "paracetamol", "acetaminophen", "amoxicillin", "doxycycline",
-    "azithromycin", "metformin", "prednisone", "prednisolone", "augmentin",
-    "cephalexin", "ciprofloxacin", "metronidazole", "tylenol", "motrin", "aspirin",
-    "naproxen", "hydroxychloroquine", "remicade", "humira", "antibiotics",
-    "antibiotic", "nsaids", "antihistamine", "sertraline", "gabapentin",
-    "lisinopril", "atorvastatin", "omeprazole", "levothyroxine", "concerta",
-    "valtrex", "revlimid", "betnovate", "rabipur",
+    # --- Pain relievers / NSAIDs / analgesics ---
+    "ibuprofen", "advil", "motrin", "nurofen",
+    "paracetamol", "acetaminophen", "tylenol", "panadol",
+    "aspirin", "bayer", "ecotrin",
+    "naproxen", "aleve", "naprosyn",
+    "diclofenac", "voltaren", "cataflam",
+    "celecoxib", "celebrex",
+    "meloxicam", "mobic",
+    "indomethacin", "indocin",
+    "ketorolac", "toradol",
+    "tramadol", "ultram",
+    "codeine", "tylenol 3",
+    "oxycodone", "oxycontin", "percocet",
+    "hydrocodone", "vicodin", "norco",
+    "morphine", "ms contin",
+    "fentanyl", "duragesic",
+    "buprenorphine", "suboxone",
+
+    # --- Antibiotics ---
+    "amoxicillin", "amoxil",
+    "augmentin", "amoxicillin-clavulanate",
+    "ampicillin",
+    "penicillin",
+    "cephalexin", "keflex",
+    "cefuroxime", "ceftin",
+    "ceftriaxone", "rocephin",
+    "doxycycline", "vibramycin",
+    "minocycline", "minocin",
+    "tetracycline",
+    "azithromycin", "zithromax", "z-pak",
+    "clarithromycin", "biaxin",
+    "erythromycin",
+    "ciprofloxacin", "cipro",
+    "levofloxacin", "levaquin",
+    "moxifloxacin", "avelox",
+    "metronidazole", "flagyl",
+    "clindamycin", "cleocin",
+    "trimethoprim-sulfamethoxazole", "bactrim", "septra",
+    "nitrofurantoin", "macrobid",
+    "vancomycin",
+    "linezolid", "zyvox",
+    "rifampin",
+    "antibiotics", "antibiotic",
+
+    # --- Antivirals ---
+    "acyclovir", "zovirax",
+    "valacyclovir", "valtrex",
+    "famciclovir", "famvir",
+    "oseltamivir", "tamiflu",
+    "remdesivir", "veklury",
+    "paxlovid", "nirmatrelvir-ritonavir",
+    "molnupiravir",
+
+    # --- Antifungals ---
+    "fluconazole", "diflucan",
+    "nystatin",
+    "terbinafine", "lamisil",
+    "ketoconazole",
+
+    # --- Antiparasitics / vaccines / specialty ---
+    "ivermectin",
+    "hydroxychloroquine", "plaquenil",
+    "chloroquine",
+    "rabipur", "rabies vaccine",
+
+    # --- Corticosteroids ---
+    "prednisone",
+    "prednisolone",
+    "methylprednisolone", "medrol",
+    "dexamethasone", "decadron",
+    "hydrocortisone",
+    "triamcinolone",
+    "betamethasone", "betnovate",
+    "fluticasone", "flonase", "flovent",
+    "budesonide", "pulmicort",
+    "mometasone", "nasonex",
+
+    # --- Immunosuppressants / biologics / DMARDs ---
+    "methotrexate",
+    "azathioprine", "imuran",
+    "cyclosporine",
+    "tacrolimus",
+    "mycophenolate", "cellcept",
+    "infliximab", "remicade",
+    "adalimumab", "humira",
+    "etanercept", "enbrel",
+    "rituximab", "rituxan",
+    "tocilizumab", "actemra",
+    "ustekinumab", "stelara",
+    "secukinumab", "cosentyx",
+    "lenalidomide", "revlimid",
+    "thalidomide",
+    "cyclophosphamide",
+
+    # --- Antihistamines / allergy ---
+    "diphenhydramine", "benadryl",
+    "loratadine", "claritin",
+    "cetirizine", "zyrtec",
+    "fexofenadine", "allegra",
+    "levocetirizine", "xyzal",
+    "desloratadine", "clarinex",
+    "hydroxyzine", "atarax", "vistaril",
+    "antihistamine", "antihistamines",
+    "nsaids", "nsaid",
+
+    # --- Mental health: SSRIs / SNRIs / antidepressants ---
+    "sertraline", "zoloft",
+    "fluoxetine", "prozac",
+    "escitalopram", "lexapro",
+    "citalopram", "celexa",
+    "paroxetine", "paxil",
+    "venlafaxine", "effexor",
+    "duloxetine", "cymbalta",
+    "bupropion", "wellbutrin",
+    "mirtazapine", "remeron",
+    "trazodone",
+    "amitriptyline", "elavil",
+    "nortriptyline",
+
+    # --- Anxiety / sedatives ---
+    "alprazolam", "xanax",
+    "lorazepam", "ativan",
+    "clonazepam", "klonopin",
+    "diazepam", "valium",
+    "buspirone", "buspar",
+    "zolpidem", "ambien",
+    "eszopiclone", "lunesta",
+    "melatonin",
+
+    # --- ADHD / stimulants ---
+    "methylphenidate", "ritalin", "concerta",
+    "amphetamine", "adderall",
+    "lisdexamfetamine", "vyvanse",
+    "atomoxetine", "strattera",
+
+    # --- Anticonvulsants / nerve pain ---
+    "gabapentin", "neurontin",
+    "pregabalin", "lyrica",
+    "topiramate", "topamax",
+    "lamotrigine", "lamictal",
+    "valproate", "depakote",
+    "carbamazepine", "tegretol",
+    "levetiracetam", "keppra",
+    "phenytoin", "dilantin",
+
+    # --- Cardiovascular / blood pressure ---
+    "lisinopril", "prinivil", "zestril",
+    "enalapril", "vasotec",
+    "ramipril", "altace",
+    "losartan", "cozaar",
+    "valsartan", "diovan",
+    "amlodipine", "norvasc",
+    "metoprolol", "lopressor", "toprol",
+    "atenolol", "tenormin",
+    "carvedilol", "coreg",
+    "propranolol", "inderal",
+    "hydrochlorothiazide", "hctz",
+    "furosemide", "lasix",
+    "spironolactone", "aldactone",
+    "clonidine", "catapres",
+
+    # --- Cholesterol / lipids ---
+    "atorvastatin", "lipitor",
+    "rosuvastatin", "crestor",
+    "simvastatin", "zocor",
+    "pravastatin", "pravachol",
+    "ezetimibe", "zetia",
+
+    # --- Anticoagulants / antiplatelets ---
+    "warfarin", "coumadin",
+    "apixaban", "eliquis",
+    "rivaroxaban", "xarelto",
+    "dabigatran", "pradaxa",
+    "clopidogrel", "plavix",
+    "heparin",
+    "enoxaparin", "lovenox",
+
+    # --- Diabetes ---
+    "metformin", "glucophage",
+    "glipizide", "glucotrol",
+    "glyburide",
+    "sitagliptin", "januvia",
+    "empagliflozin", "jardiance",
+    "dapagliflozin", "farxiga",
+    "canagliflozin", "invokana",
+    "liraglutide", "victoza",
+    "semaglutide", "ozempic", "wegovy", "rybelsus",
+    "tirzepatide", "mounjaro", "zepbound",
+    "insulin", "humalog", "novolog", "lantus", "tresiba",
+
+    # --- Thyroid ---
+    "levothyroxine", "synthroid", "levoxyl",
+    "liothyronine", "cytomel",
+    "methimazole", "tapazole",
+    "propylthiouracil", "ptu",
+
+    # --- GI / acid reflux / antiemetics ---
+    "omeprazole", "prilosec",
+    "esomeprazole", "nexium",
+    "pantoprazole", "protonix",
+    "lansoprazole", "prevacid",
+    "ranitidine", "zantac",
+    "famotidine", "pepcid",
+    "ondansetron", "zofran",
+    "promethazine", "phenergan",
+    "metoclopramide", "reglan",
+    "loperamide", "imodium",
+    "bismuth subsalicylate", "pepto-bismol",
+
+    # --- Respiratory / asthma / COPD ---
+    "albuterol", "ventolin", "proair", "salbutamol",
+    "salmeterol", "serevent",
+    "tiotropium", "spiriva",
+    "ipratropium", "atrovent",
+    "montelukast", "singulair",
+
+    # --- Bone / osteoporosis ---
+    "alendronate", "fosamax",
+    "risedronate", "actonel",
+    "denosumab", "prolia",
+
+    # --- Other / specialty ---
+    "low-dose naltrexone", "ldn",
+    "ivig", "intravenous immunoglobulin",
+    "pyridostigmine", "mestinon",
+    "midodrine",
+    "fludrocortisone", "florinef",
+    "ketamine",
+    "modafinil", "provigil",
+    "sildenafil", "viagra",
+    "tadalafil", "cialis",
 ]
+
+
+# ============================================================================
+# CONDITIONS / DIAGNOSES
+# ============================================================================
 CONDITION_LIST = [
-    "fever", "fatigue", "covid", "long covid", "fibromyalgia", "lupus",
-    "lyme disease", "pots", "mcas", "eds", "cfs", "me/cfs", "chronic fatigue",
-    "arthritis", "thyroid", "hypothyroidism", "anemia", "infection",
-    "pneumonia", "bronchitis", "sinusitis", "appendicitis", "gastritis",
-    "endometriosis", "mononucleosis", "sepsis", "depression", "anxiety",
-    "migraine", "diabetes", "hypertension", "asthma", "barth syndrome",
+    # --- Infectious diseases ---
+    "infection", "bacterial infection", "viral infection",
+    "covid", "covid-19", "coronavirus", "sars-cov-2",
+    "long covid", "post-covid syndrome", "pasc",
+    "influenza", "flu",
+    "rsv", "respiratory syncytial virus",
+    "common cold", "upper respiratory infection", "uri",
+    "pneumonia", "viral pneumonia", "bacterial pneumonia",
+    "bronchitis", "acute bronchitis",
+    "sinusitis", "rhinosinusitis",
+    "pharyngitis", "strep throat", "streptococcal pharyngitis",
+    "tonsillitis",
+    "otitis media", "ear infection",
+    "urinary tract infection", "uti", "cystitis", "pyelonephritis",
+    "appendicitis",
+    "gastritis",
+    "gastroenteritis", "stomach flu",
+    "cellulitis",
+    "mononucleosis", "mono", "epstein-barr virus", "ebv",
+    "cytomegalovirus", "cmv",
+    "herpes simplex", "hsv", "hsv-1", "hsv-2",
+    "shingles", "herpes zoster",
+    "chickenpox", "varicella",
+    "lyme disease", "borreliosis", "post-treatment lyme disease syndrome",
+    "babesiosis",
+    "bartonellosis",
+    "ehrlichiosis",
+    "rocky mountain spotted fever",
+    "tuberculosis", "tb",
+    "hiv", "aids",
+    "hepatitis a", "hepatitis b", "hepatitis c",
+    "malaria",
+    "dengue",
+    "zika",
+    "rabies",
+    "sepsis", "septic shock",
+
+    # --- Autoimmune / rheumatologic ---
+    "lupus", "systemic lupus erythematosus", "sle",
+    "rheumatoid arthritis", "ra",
+    "psoriatic arthritis",
+    "ankylosing spondylitis",
+    "sjogren's syndrome",
+    "scleroderma", "systemic sclerosis",
+    "vasculitis",
+    "polymyalgia rheumatica",
+    "giant cell arteritis",
+    "multiple sclerosis", "ms",
+    "myasthenia gravis",
+    "guillain-barre syndrome",
+    "celiac disease",
+    "crohn's disease",
+    "ulcerative colitis",
+    "inflammatory bowel disease", "ibd",
+    "hashimoto's thyroiditis",
+    "graves' disease",
+    "type 1 diabetes",
+
+    # --- Chronic illness / complex conditions ---
+    "fibromyalgia",
+    "chronic fatigue syndrome", "cfs", "me/cfs", "myalgic encephalomyelitis",
+    "chronic fatigue",
+    "pots", "postural orthostatic tachycardia syndrome",
+    "dysautonomia", "autonomic dysfunction",
+    "mcas", "mast cell activation syndrome",
+    "mastocytosis",
+    "eds", "ehlers-danlos syndrome", "hypermobile eds", "heds",
+    "hypermobility spectrum disorder",
+    "marfan syndrome",
+    "barth syndrome",
+    "mitochondrial disease",
+
+    # --- Endocrine / metabolic ---
+    "thyroid", "thyroid disease", "thyroid disorder",
+    "hypothyroidism",
+    "hyperthyroidism",
+    "diabetes", "type 2 diabetes",
+    "prediabetes",
+    "insulin resistance",
+    "metabolic syndrome",
+    "pcos", "polycystic ovary syndrome",
+    "addison's disease", "adrenal insufficiency",
+    "cushing's syndrome",
+    "hypoglycemia",
+
+    # --- Hematology ---
+    "anemia", "iron deficiency anemia", "b12 deficiency",
+    "vitamin d deficiency",
+    "thrombocytopenia",
+    "hemophilia",
+    "sickle cell disease",
+    "leukemia",
+    "lymphoma", "non-hodgkin lymphoma", "hodgkin lymphoma",
+    "multiple myeloma",
+
+    # --- Cardiovascular ---
+    "hypertension", "high blood pressure",
+    "hypotension", "low blood pressure",
+    "coronary artery disease", "cad",
+    "heart failure", "congestive heart failure", "chf",
+    "atrial fibrillation", "afib",
+    "arrhythmia",
+    "myocarditis",
+    "pericarditis",
+    "deep vein thrombosis", "dvt",
+    "pulmonary embolism", "pe",
+    "stroke", "tia",
+
+    # --- Pulmonary ---
+    "asthma",
+    "copd", "chronic obstructive pulmonary disease",
+    "emphysema",
+    "sleep apnea", "obstructive sleep apnea",
+    "pulmonary fibrosis",
+
+    # --- Neurology ---
+    "migraine", "chronic migraine",
+    "tension headache",
+    "cluster headache",
+    "epilepsy", "seizure disorder",
+    "parkinson's disease",
+    "alzheimer's disease",
+    "dementia",
+    "neuropathy", "peripheral neuropathy",
+    "small fiber neuropathy",
+    "trigeminal neuralgia",
+    "concussion", "post-concussion syndrome",
+
+    # --- Mental health ---
+    "depression", "major depressive disorder", "mdd",
+    "anxiety", "generalized anxiety disorder", "gad",
+    "panic disorder",
+    "ocd", "obsessive compulsive disorder",
+    "ptsd", "post-traumatic stress disorder",
+    "bipolar disorder",
+    "adhd", "attention deficit hyperactivity disorder",
+    "autism", "autism spectrum disorder", "asd",
+    "eating disorder", "anorexia", "bulimia", "arfid",
+
+    # --- GI ---
+    "ibs", "irritable bowel syndrome",
+    "gerd", "acid reflux",
+    "peptic ulcer",
+    "diverticulitis",
+    "gastroparesis",
+    "sibo", "small intestinal bacterial overgrowth",
+
+    # --- Reproductive / women's health ---
+    "endometriosis",
+    "adenomyosis",
+    "uterine fibroids",
+    "menopause",
+    "perimenopause",
+
+    # --- Cancer (general) ---
+    "cancer",
+    "breast cancer",
+    "lung cancer",
+    "colorectal cancer",
+    "prostate cancer",
+    "skin cancer", "melanoma",
+
+    # --- Skin ---
+    "eczema", "atopic dermatitis",
+    "psoriasis",
+    "rosacea",
+    "acne",
+    "hives", "urticaria",
+
+    # --- Generic/symptomatic ---
+    "fever", "fever of unknown origin", "fuo",
+    "fatigue",
+    "inflammation",
+    "allergies", "seasonal allergies",
+    "anaphylaxis",
 ]
+
+
+# ============================================================================
+# SYMPTOMS
+# ============================================================================
 SYMPTOM_LIST = [
-    "fever", "fatigue", "chills", "nausea", "vomiting", "headache",
-    "body aches", "muscle pain", "joint pain", "weakness", "dizziness",
-    "shortness of breath", "chest pain", "rash", "swollen lymph nodes",
-    "night sweats", "weight loss", "brain fog", "palpitations", "insomnia",
-    "dry mouth", "hair loss", "numbness", "tingling", "dry eyes",
+    # --- Constitutional / systemic ---
+    "fever", "low-grade fever", "high fever",
+    "chills", "rigors",
+    "sweating", "night sweats", "diaphoresis",
+    "fatigue", "exhaustion", "lethargy",
+    "malaise", "feeling unwell",
+    "post-exertional malaise", "pem", "crash",
+    "weakness", "muscle weakness", "generalized weakness",
+    "weight loss", "unintentional weight loss",
+    "weight gain", "unexplained weight gain",
+    "loss of appetite", "anorexia",
+    "increased appetite",
+    "dehydration",
+
+    # --- Pain ---
+    "headache", "tension headache", "migraine",
+    "body aches", "muscle pain", "myalgia",
+    "joint pain", "arthralgia",
+    "back pain", "lower back pain",
+    "neck pain", "stiff neck",
+    "chest pain", "tightness in chest",
+    "abdominal pain", "stomach pain", "stomach cramps",
+    "pelvic pain",
+    "facial pain",
+    "nerve pain", "neuropathic pain", "burning pain",
+
+    # --- Neurological / cognitive ---
+    "dizziness", "lightheadedness", "vertigo",
+    "fainting", "syncope", "presyncope", "near-fainting",
+    "brain fog", "cognitive dysfunction", "difficulty concentrating",
+    "memory loss", "forgetfulness", "memory problems",
+    "confusion", "disorientation",
+    "tremor", "shaking",
+    "seizures", "convulsions",
+    "numbness",
+    "tingling", "pins and needles", "paresthesia",
+    "muscle twitching", "fasciculations",
+    "balance problems", "coordination problems", "ataxia",
+    "blurred vision", "double vision", "vision changes",
+    "sensitivity to light", "photophobia",
+    "sensitivity to sound", "phonophobia",
+    "ringing in ears", "tinnitus",
+    "loss of smell", "anosmia",
+    "loss of taste", "ageusia",
+
+    # --- Psychiatric / sleep ---
+    "anxiety", "feeling anxious",
+    "depression", "feeling depressed", "low mood",
+    "irritability",
+    "mood swings",
+    "panic attacks",
+    "insomnia", "difficulty sleeping", "trouble falling asleep",
+    "early morning waking",
+    "hypersomnia", "excessive sleepiness",
+    "vivid dreams", "nightmares",
+    "unrefreshing sleep",
+    "racing thoughts",
+
+    # --- Cardiovascular ---
+    "palpitations", "heart racing", "fluttering heartbeat",
+    "tachycardia", "fast heart rate",
+    "bradycardia", "slow heart rate",
+    "shortness of breath", "dyspnea", "breathlessness",
+    "air hunger",
+    "swelling in legs", "swelling in ankles", "edema",
+    "cold hands and feet",
+    "blood pressure changes",
+    "orthostatic intolerance",
+
+    # --- Respiratory / ENT ---
+    "cough", "dry cough", "productive cough", "wet cough",
+    "wheezing",
+    "sore throat",
+    "runny nose", "rhinorrhea",
+    "stuffy nose", "nasal congestion",
+    "post-nasal drip",
+    "sneezing",
+    "hoarseness", "voice changes",
+    "difficulty swallowing", "dysphagia",
+    "earache", "ear pain",
+
+    # --- GI ---
+    "nausea",
+    "vomiting",
+    "diarrhea",
+    "constipation",
+    "bloating",
+    "gas", "flatulence",
+    "abdominal cramps",
+    "heartburn", "acid reflux",
+    "indigestion", "dyspepsia",
+    "blood in stool",
+    "black stool", "melena",
+    "early satiety", "feeling full quickly",
+    "regurgitation",
+
+    # --- Urinary ---
+    "frequent urination",
+    "painful urination", "dysuria",
+    "blood in urine", "hematuria",
+    "urinary urgency",
+    "incontinence",
+
+    # --- Skin / allergic ---
+    "rash", "skin rash",
+    "hives", "urticaria",
+    "itching", "pruritus",
+    "flushing", "skin flushing",
+    "easy bruising",
+    "dry skin",
+    "skin discoloration",
+    "petechiae",
+    "swollen lymph nodes", "lymphadenopathy",
+
+    # --- Endocrine / metabolic ---
+    "hair loss", "thinning hair",
+    "brittle nails",
+    "heat intolerance",
+    "cold intolerance",
+    "excessive thirst", "polydipsia",
+    "frequent urination at night", "nocturia",
+
+    # --- Mucosal / sicca ---
+    "dry mouth", "xerostomia",
+    "dry eyes",
+    "mouth ulcers", "canker sores",
+
+    # --- Musculoskeletal ---
+    "muscle stiffness",
+    "joint stiffness", "morning stiffness",
+    "joint swelling",
+    "muscle cramps",
+    "muscle spasms",
+    "joint hypermobility",
+    "frequent joint dislocations", "subluxations",
+
+    # --- Reproductive / hormonal ---
+    "irregular periods",
+    "heavy menstrual bleeding", "menorrhagia",
+    "missed periods", "amenorrhea",
+    "hot flashes",
+
+    # --- Other ---
+    "bruising",
+    "bleeding gums",
+    "nosebleeds", "epistaxis",
+    "frequent infections",
+    "slow wound healing",
+    "exercise intolerance",
 ]
 
 def extract_entities(text):
@@ -768,11 +1253,307 @@ def detect_pii(text):
 # RISK SCORING — 0-100
 # ===========================================================
 
-SYMPTOM_KW   = ["fever", "fatigue", "pain", "chills", "nausea", "weak", "headache", "vomiting", "rash"]
-WORSENING_KW = ["worse", "worsening", "getting worse", "not improving", "deteriorating", "declining"]
-DURATION_KW  = ["days", "weeks", "months", "still", "since", "persistent", "chronic", "prolonged", "ongoing"]
-FAILURE_KW   = ["not working", "no effect", "not helping", "failed", "ineffective", "antibiotics aren't working"]
-POSITIVE_KW  = ["better", "improving", "recovered", "resolved", "cured", "remission"]
+# ============================================================================
+# SYMPTOM KEYWORDS
+# Common symptom words/phrases to scan free-text for any mention of illness.
+# ============================================================================
+SYMPTOM_KW = [
+    # --- Constitutional ---
+    "fever", "feverish", "high temperature", "running a temperature", "temp of",
+    "chills", "shivering", "rigors", "shaking",
+    "sweats", "night sweats", "sweating", "drenching sweats",
+    "fatigue", "fatigued", "tired", "exhausted", "exhaustion",
+    "wiped out", "drained", "wornout", "worn out", "burnt out",
+    "lethargy", "lethargic", "sluggish",
+    "malaise", "feeling unwell", "feel awful", "feel terrible",
+    "weak", "weakness", "feel weak", "lack of strength",
+    "post-exertional malaise", "pem", "crash", "crashing",
+
+    # --- Pain ---
+    "pain", "painful", "ache", "aches", "aching", "achy",
+    "soreness", "tender", "tenderness",
+    "headache", "headaches", "migraine", "migraines",
+    "head pounding", "throbbing head",
+    "body aches", "muscle pain", "muscle aches", "myalgia",
+    "joint pain", "joints hurt", "arthralgia",
+    "back pain", "backache",
+    "chest pain", "chest tightness", "tight chest",
+    "abdominal pain", "stomach pain", "stomach ache", "tummy ache",
+    "cramping", "cramps", "stomach cramps",
+    "burning sensation", "stinging",
+
+    # --- GI ---
+    "nausea", "nauseous", "queasy", "feel sick", "feeling sick",
+    "vomiting", "vomit", "throwing up", "threw up", "puking",
+    "diarrhea", "loose stools", "runs",
+    "constipation", "constipated", "can't go",
+    "bloating", "bloated", "distended",
+    "heartburn", "acid reflux", "indigestion",
+
+    # --- Respiratory / ENT ---
+    "cough", "coughing", "dry cough", "wet cough", "productive cough",
+    "shortness of breath", "short of breath", "breathless", "can't breathe",
+    "trouble breathing", "difficulty breathing", "dyspnea",
+    "wheezing", "wheeze",
+    "sore throat", "throat hurts", "scratchy throat",
+    "runny nose", "stuffy nose", "congestion", "congested",
+    "sneezing",
+
+    # --- Neurological / cognitive ---
+    "dizzy", "dizziness", "lightheaded", "light-headed", "vertigo",
+    "fainting", "passed out", "blacking out", "black out", "syncope",
+    "near-fainting", "nearly fainted",
+    "brain fog", "foggy", "can't think clearly", "mental fog",
+    "memory problems", "forgetful", "forgetting things",
+    "confusion", "confused", "disoriented",
+    "numbness", "numb",
+    "tingling", "pins and needles", "paresthesia",
+    "tremor", "tremors", "shaky", "shaking",
+    "blurred vision", "blurry vision", "vision problems",
+    "ringing in ears", "tinnitus",
+
+    # --- Cardiovascular ---
+    "palpitations", "heart racing", "racing heart", "pounding heart",
+    "skipped beats", "fluttering",
+    "tachycardia", "fast heart rate",
+
+    # --- Skin / allergic ---
+    "rash", "rashes", "breaking out", "skin eruption",
+    "hives", "welts", "urticaria",
+    "itching", "itchy", "itches", "pruritus",
+    "swelling", "swollen",
+    "bruising", "bruises easily",
+    "flushing", "flushed",
+
+    # --- Sleep / mood ---
+    "insomnia", "can't sleep", "trouble sleeping", "sleepless",
+    "unrefreshing sleep", "wake up tired",
+    "anxiety", "anxious", "panicky",
+    "depressed", "low mood", "feeling down",
+
+    # --- Other red flags ---
+    "weight loss", "losing weight", "lost weight",
+    "loss of appetite", "no appetite", "can't eat",
+    "swollen lymph nodes", "swollen glands", "lumps in neck",
+    "hair loss", "losing hair",
+    "dry mouth", "dry eyes",
+    "mouth ulcers", "canker sores",
+    "blood in stool", "blood in urine", "coughing up blood",
+]
+
+
+# ============================================================================
+# WORSENING / DECLINE KEYWORDS
+# Phrases indicating the patient is getting sicker or not progressing.
+# ============================================================================
+WORSENING_KW = [
+    # --- Direct "worse" phrasings ---
+    "worse", "worsening", "worsened",
+    "getting worse", "got worse", "gotten worse", "keeps getting worse",
+    "feels worse", "feeling worse",
+    "much worse", "even worse", "way worse",
+    "progressively worse", "worse and worse",
+
+    # --- Decline / deterioration ---
+    "deteriorating", "deteriorated", "deterioration",
+    "declining", "declined", "in decline",
+    "going downhill", "going down hill", "downhill",
+    "spiraling", "spiraling down",
+    "regressing", "regression",
+    "backsliding",
+
+    # --- Lack of improvement ---
+    "not improving", "no improvement", "isn't improving", "hasn't improved",
+    "haven't improved", "no signs of improvement",
+    "not getting better", "isn't getting better", "hasn't gotten better",
+    "haven't gotten better", "doesn't seem to be getting better",
+    "not recovering", "hasn't recovered", "haven't recovered",
+    "no recovery",
+    "no progress", "lack of progress",
+    "stalled", "stuck", "plateaued",
+
+    # --- Persistence / lingering ---
+    "still sick", "still ill", "still feeling bad",
+    "still have", "still having",
+    "lingering", "lingers", "won't go away", "wont go away",
+    "won't resolve", "hasn't resolved", "haven't resolved",
+    "keeps coming back", "comes back", "recurring", "recurrence",
+    "relapse", "relapsed", "relapsing",
+    "flare", "flare-up", "flaring", "flare up",
+
+    # --- Increasing severity / spreading ---
+    "more severe", "increasing severity", "intensifying", "intensified",
+    "escalating", "escalated",
+    "spreading", "spread",
+    "new symptoms", "additional symptoms",
+    "harder to manage", "out of control", "uncontrolled",
+
+    # --- Patient impact ---
+    "can't function", "cannot function",
+    "bedridden", "bed-bound", "confined to bed",
+    "couldn't get out of bed",
+    "barely functioning",
+    "alarmed", "concerned", "worried it's getting worse",
+]
+
+
+# ============================================================================
+# DURATION KEYWORDS
+# Phrases that indicate symptoms have lasted a long time / are chronic.
+# ============================================================================
+DURATION_KW = [
+    # --- Time units ---
+    "hours", "days", "weeks", "months", "years", "decades",
+    "a few days", "several days", "many days",
+    "a few weeks", "several weeks", "many weeks",
+    "a few months", "several months", "many months",
+    "over a week", "over two weeks", "over a month", "over six months",
+    "more than a week", "more than a month", "more than a year",
+
+    # --- Continuation words ---
+    "still", "still have", "still feeling", "still experiencing",
+    "since", "ever since", "since last", "since then",
+    "from", "starting from",
+
+    # --- Chronicity language ---
+    "persistent", "persisting", "persists", "persisted",
+    "chronic", "chronically",
+    "prolonged", "protracted",
+    "ongoing", "continues", "continuing", "continued", "continual",
+    "constant", "constantly",
+    "non-stop", "nonstop", "around the clock",
+    "long time", "long-time", "for a long time",
+    "long-term", "long term",
+    "long-standing", "longstanding", "long-running",
+    "for ages", "forever", "as long as I can remember",
+    "all the time",
+
+    # --- "Hasn't gotten better" framings ---
+    "haven't gotten better", "hasn't gotten better",
+    "haven't improved", "hasn't improved",
+    "no improvement after", "no improvement since",
+    "without improvement", "without resolution",
+    "not resolved", "unresolved",
+
+    # --- Onset / "symptoms ___" patterns ---
+    "symptoms for", "symptoms since", "symptoms lasting",
+    "symptoms over", "symptoms that started",
+    "symptoms that have been going on for",
+    "symptoms that have been persisting for",
+    "symptoms that won't go away",
+    "started having", "began having", "first noticed",
+    "started a week ago", "started months ago", "started last year",
+
+    # --- Recurrence patterns (also relevant to duration) ---
+    "off and on", "on and off", "comes and goes",
+    "recurrent", "intermittent", "intermittently",
+    "every few days", "every week", "every month",
+    "for as long as", "ever since I can remember",
+]
+
+
+# ============================================================================
+# TREATMENT FAILURE KEYWORDS
+# Indicates a prescribed treatment isn't producing the expected response.
+# ============================================================================
+FAILURE_KW = [
+    # --- Generic "not working" ---
+    "not working", "isn't working", "doesn't work", "didn't work",
+    "stopped working", "no longer working",
+    "not effective", "ineffective", "not very effective",
+    "no effect", "having no effect", "had no effect",
+    "no response", "no response to treatment", "non-responsive",
+    "unresponsive to treatment",
+
+    # --- "Not helping" ---
+    "not helping", "isn't helping", "doesn't help", "didn't help",
+    "hasn't helped", "haven't helped",
+    "not making a difference", "doesn't make a difference",
+    "no difference", "made no difference",
+    "no relief", "no symptom relief", "no pain relief",
+    "minimal relief", "barely any relief",
+
+    # --- Failure language ---
+    "failed", "failing", "treatment failure",
+    "treatment failed", "therapy failed",
+    "didn't respond", "did not respond",
+    "refractory", "treatment-resistant", "resistant to treatment",
+    "drug-resistant", "antibiotic-resistant",
+
+    # --- Specific drug classes ---
+    "antibiotics aren't working", "antibiotics not working",
+    "antibiotics didn't work", "antibiotics haven't worked",
+    "second course of antibiotics", "third round of antibiotics",
+    "another round of antibiotics",
+    "steroids didn't help", "steroids aren't working",
+    "painkillers aren't working", "pain meds not helping",
+    "nothing is working", "nothing has worked",
+    "tried everything", "tried every medication",
+
+    # --- Worsening despite treatment ---
+    "worse on medication", "worse despite treatment",
+    "worse despite antibiotics",
+    "no better despite", "still sick despite",
+    "still symptomatic despite",
+
+    # --- Side-effect / tolerance issues ---
+    "couldn't tolerate", "can't tolerate", "intolerant to",
+    "had to stop", "had to discontinue",
+    "made me worse",
+]
+
+
+# ============================================================================
+# POSITIVE / IMPROVEMENT KEYWORDS
+# Phrases indicating the patient is recovering or has resolved symptoms.
+# ============================================================================
+POSITIVE_KW = [
+    # --- Direct improvement ---
+    "better", "feeling better", "feel better", "much better",
+    "a lot better", "significantly better", "noticeably better",
+    "improving", "improved", "improvement", "showing improvement",
+    "on the mend", "mending",
+    "getting better", "got better", "gotten better",
+    "bouncing back", "back to normal", "back to myself",
+    "back on my feet",
+
+    # --- Recovery ---
+    "recovered", "recovering", "recovery",
+    "fully recovered", "making a full recovery",
+    "healed", "healing", "all healed up",
+    "well", "all well", "completely well",
+
+    # --- Resolution ---
+    "resolved", "resolving", "resolution",
+    "gone", "all gone", "symptoms gone",
+    "cleared up", "cleared", "clearing up",
+    "subsided", "subsiding",
+    "went away", "gone away",
+    "no more symptoms", "symptom-free", "symptom free",
+    "asymptomatic",
+
+    # --- Cure / remission ---
+    "cured", "cure",
+    "remission", "in remission", "full remission", "complete remission",
+    "disease-free", "disease free",
+    "no recurrence",
+
+    # --- Treatment working ---
+    "treatment is working", "medication is working",
+    "responding well", "responded well", "good response",
+    "responding to treatment",
+    "antibiotics worked", "the medication helped",
+    "made a difference", "really helped",
+    "huge improvement", "dramatic improvement",
+    "night and day difference",
+
+    # --- Energy / function returning ---
+    "more energy", "energy is back",
+    "able to do more", "back to activities",
+    "back at work", "back to school",
+    "stronger", "feeling stronger",
+    "no longer in pain", "pain free", "pain-free",
+]
 RISK_WEIGHTS = {
     "safety_keyword": 40, "treatment_failure": 20, "worsening": 15,
     "moderate_ae": 10, "symptom": 5, "duration": 5, "negative_sentiment": 5,
